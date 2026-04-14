@@ -21,6 +21,11 @@ Dobot E6 로봇 팔을 위한 π0.5 VLA(Vision-Language-Action) 추론 파이프
 - Dobot E6 (TCP/IP, 192.168.5.1)
 - 가상환경: move-one venv (`~/move-one/min-imum/move-one/bin/activate`)
 
+## Jetson 환경 주의사항
+
+- **HIKRobot SDK 경로**: `MVCAM_COMMON_RUNENV=/opt/MVS/lib` (lib64 아님 — aarch64 `.so`는 `/opt/MVS/lib/aarch64/`에 위치)
+- **torch.compile 비활성화**: Jetson aarch64는 Triton 미지원 → `pytorch_compile_mode=None`, `TORCHDYNAMO_DISABLE=1` 설정 필요 (run_server.sh, pi0_config.py에 반영됨)
+
 ## 빠른 시작
 
 ### 1. 가상환경 활성화

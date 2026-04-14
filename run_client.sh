@@ -28,7 +28,7 @@
 REPO="$(cd "$(dirname "$0")" && pwd)"
 source ~/move-one/min-imum/move-one/bin/activate
 
-export MVCAM_COMMON_RUNENV=/opt/MVS/lib64
+export MVCAM_COMMON_RUNENV=/opt/MVS/lib
 
 echo "=============================="
 echo " e6-vla 로봇 클라이언트"

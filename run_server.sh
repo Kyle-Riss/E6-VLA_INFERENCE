@@ -25,7 +25,10 @@ REPO="$(cd "$(dirname "$0")" && pwd)"
 source ~/move-one/min-imum/move-one/bin/activate
 
 # HIKRobot MVS SDK (카메라 없어도 무방하지만 경로는 설정)
-export MVCAM_COMMON_RUNENV=/opt/MVS/lib64
+export MVCAM_COMMON_RUNENV=/opt/MVS/lib
+
+# Jetson aarch64: Triton 미지원 → torch.compile 비활성화
+export TORCHDYNAMO_DISABLE=1
 
 echo "=============================="
 echo " e6-vla 정책 서버"
