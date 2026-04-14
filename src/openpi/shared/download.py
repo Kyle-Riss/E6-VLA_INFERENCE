@@ -1,6 +1,10 @@
 import concurrent.futures
 import datetime
 import logging
+
+# Python 3.10 호환: datetime.UTC는 3.11에서 추가됨
+if not hasattr(datetime, "UTC"):
+    datetime.UTC = datetime.timezone.utc  # type: ignore[attr-defined]
 import os
 import pathlib
 import re
