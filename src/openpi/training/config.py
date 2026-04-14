@@ -1058,6 +1058,69 @@ _CONFIGS = [
     # RoboArena & PolaRiS configs.
     *roboarena_config.get_roboarena_configs(),
     *polaris_config.get_polaris_configs(),
+    #
+    # Dobot E6 custom fine-tune configs.
+    # These mirror the configs in move-one/openpi/src/openpi/training/config.py so that
+    # serve_policy.py can load user-trained checkpoints without modifying move-one.
+    # All three configs use DroidInputs/DroidOutputs (8-D action contract: Δq[0..5], pad, gripper).
+    #
+    TrainConfig(
+        name="pi0_e6_freeze_vlm",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=10,
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m",
+        ),
+        data=SimpleDataConfig(
+            assets=AssetsConfig(asset_id="droid"),
+            data_transforms=lambda model: _transforms.Group(
+                inputs=[droid_policy.DroidInputs(model_type=ModelType.PI05)],
+                outputs=[droid_policy.DroidOutputs()],
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+    ),
+    TrainConfig(
+        # Primitive-176 local fine-tune (DROID or BASE init; same DroidInputs contract).
+        name="pi0_e6_freeze_vlm_primitive_176_local",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=10,
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m",
+        ),
+        data=SimpleDataConfig(
+            assets=AssetsConfig(asset_id="local/primitive_tagged_v1_full"),
+            data_transforms=lambda model: _transforms.Group(
+                inputs=[droid_policy.DroidInputs(model_type=ModelType.PI05)],
+                outputs=[droid_policy.DroidOutputs()],
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+    ),
+    TrainConfig(
+        # Primitive-176 UR5-style run (exterior only; wrist slot zeroed at inference).
+        # Pass --input_layout ur5_style to the client so wrist_image is zeros.
+        name="pi0_e6_freeze_vlm_primitive_176_local_ur5",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=10,
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m",
+        ),
+        data=SimpleDataConfig(
+            assets=AssetsConfig(asset_id="local/primitive_tagged_v1_full"),
+            data_transforms=lambda model: _transforms.Group(
+                inputs=[droid_policy.DroidInputs(model_type=ModelType.PI05)],
+                outputs=[droid_policy.DroidOutputs()],
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+    ),
 ]
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
