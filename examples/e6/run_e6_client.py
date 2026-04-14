@@ -128,8 +128,13 @@ def main() -> None:
 
     # ── 관측/액션 계약 ────────────────────────────────────────────────────────
     parser.add_argument(
-        "--input_layout", choices=["baseline", "ur5_style"], default="baseline",
-        help="baseline=wrist=top복제, ur5_style=wrist=zeros"
+        "--input_layout", choices=["baseline", "ur5_style", "e6_v1"], default="baseline",
+        help=(
+            "baseline: wrist=top 복제 (DroidInputs, joint_position rad 8D)\n"
+            "ur5_style: wrist=zeros (DroidInputs, joint_position rad 8D)\n"
+            "e6_v1: exterior only, state=deg 7D (E6Inputs, pi05_e6_v1/lora 전용)\n"
+            "       actions[:,:6]=Δdeg, actions[:,6]=gripper abs"
+        )
     )
 
     # ── 제어 루프 ─────────────────────────────────────────────────────────────
@@ -375,15 +380,33 @@ def main() -> None:
                     except Exception:
                         pass
 
-                wrist_img = np.zeros_like(obs_img) if args.input_layout == "ur5_style" else obs_img.copy()
-
-                obs = {
-                    "observation/exterior_image_1_left": obs_img,
-                    "observation/wrist_image_left": wrist_img,
-                    "observation/joint_position": joint_7,
-                    "observation/gripper_position": gripper_pos,
-                    "prompt": args.prompt,
-                }
+                if args.input_layout == "e6_v1":
+                    # E6Inputs 계약 (pi05_e6_v1 / pi05_e6_v1_lora):
+                    #   observation/state : (7,) float32 — [j1..j6 deg, gripper 0~1]
+                    #   observation/exterior_image_1_left 만 사용 (wrist 슬롯은 서버 내부에서 zeros)
+                    deg6 = np.zeros(6, dtype=np.float32)
+                    if feed is not None:
+                        try:
+                            fb = feed.feedBackData()
+                            q = fb["QActual"][0] if isinstance(fb, dict) else (np.asarray(fb, dtype=object)[0][17] if np.asarray(fb, dtype=object).size else [0]*6)
+                            deg6 = np.asarray(q, dtype=np.float32).ravel()[:6]
+                        except Exception:
+                            pass
+                    state_7 = np.concatenate([deg6, [current_gripper]], dtype=np.float32)
+                    obs = {
+                        "observation/exterior_image_1_left": obs_img,
+                        "observation/state": state_7,
+                        "prompt": args.prompt,
+                    }
+                else:
+                    wrist_img = np.zeros_like(obs_img) if args.input_layout == "ur5_style" else obs_img.copy()
+                    obs = {
+                        "observation/exterior_image_1_left": obs_img,
+                        "observation/wrist_image_left": wrist_img,
+                        "observation/joint_position": joint_7,
+                        "observation/gripper_position": gripper_pos,
+                        "prompt": args.prompt,
+                    }
 
                 t_infer0 = time.monotonic()
                 result = policy.infer(obs)
@@ -455,13 +478,24 @@ def main() -> None:
                     pass
 
             # ── 관절 델타 계산 ───────────────────────────────────────────────
-            delta_rad = np.asarray([float(a[i]) for i in range(6)], dtype=np.float32)
-            if args.action_scale != 1.0:
-                delta_rad *= args.action_scale
-            if camera_hold:
-                delta_rad[:] = 0.0
+            if args.input_layout == "e6_v1":
+                # E6Inputs: actions[:, 0:6] = Δ도(degree), 변환 불필요
+                delta_deg = np.asarray([float(a[i]) for i in range(6)], dtype=np.float32)
+            else:
+                # DroidInputs: actions[:, 0:6] = Δrad → deg 변환
+                delta_rad = np.asarray([float(a[i]) for i in range(6)], dtype=np.float32)
+                if args.action_scale != 1.0:
+                    delta_rad *= args.action_scale
+                if camera_hold:
+                    delta_rad[:] = 0.0
+                delta_deg = np.rad2deg(delta_rad)
 
-            delta_deg = np.rad2deg(delta_rad)
+            if args.input_layout == "e6_v1":
+                if args.action_scale != 1.0:
+                    delta_deg *= args.action_scale
+                if camera_hold:
+                    delta_deg[:] = 0.0
+
             if args.max_delta_deg > 0:
                 delta_deg = np.clip(delta_deg, -args.max_delta_deg, args.max_delta_deg)
 
