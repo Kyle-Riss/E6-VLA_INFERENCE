@@ -82,16 +82,20 @@ except ImportError:
     _camera_capture_mod = None
 
 
-# ── 프롬프트 프리셋 (e6_v1_task_contract 기반) ──────────────────────────────
+# ── 프롬프트 프리셋 (e6_v1_task_contract.py 공식 문자열) ────────────────────
+# V1_SEGMENTS = ("approach", "pick", "move", "place") 만 학습됨.
+# "return" / "init_hold" 는 학습 데이터 미포함 (OOD) → 추론 품질 보장 없음.
 TASK_PRESETS: dict[str, str] = {
-    "approach":    "approach red object",
-    "pick":        "pick red object",
-    "move_left":   "move object to left",
-    "move_right":  "move object to right",
-    "move_middle": "move object to middle",
-    "place_left":  "place object to left",
-    "place_right": "place object to right",
-    "place_middle":"place object to middle",
+    # ── V1 core (학습 데이터 포함, 추론 품질 보장) ──────────────────────────
+    "approach":    "approach red object",    # e6_v1_task_contract.task_approach()
+    "pick":        "pick red object",        # e6_v1_task_contract.task_pick()
+    "move_left":   "move object to left",    # e6_v1_task_contract.task_move("left")
+    "move_right":  "move object to right",   # e6_v1_task_contract.task_move("right")
+    "move_middle": "move object to middle",  # e6_v1_task_contract.task_move("middle")
+    "place_left":  "place object to left",   # e6_v1_task_contract.task_place("left")
+    "place_right": "place object to right",  # e6_v1_task_contract.task_place("right")
+    "place_middle":"place object to middle", # e6_v1_task_contract.task_place("middle")
+    # ── V1 외 (학습 데이터 미포함, OOD — 동작 보장 없음) ────────────────────
     "return":      "return",
     "init_hold":   "init_hold",
 }
@@ -103,6 +107,36 @@ def _stage_from_prompt(prompt: str) -> str:
         if p.startswith(tag) or f"[{tag}]" in p:
             return tag
     return "unknown"
+
+
+def _stage_complete(
+    stage: str,
+    tool_z: float | None,
+    gripper: int,
+    approach_z: float,
+    lift_z: float,
+    home_z: float,
+) -> bool:
+    """센서 기반 stage 완료 판정. π0의 env.is_episode_complete() 역할.
+
+    정책(policy)은 액션만 출력하고, 완료 판정은 환경(여기서는 TCP Z + 그리퍼)이 담당.
+    """
+    if tool_z is None:
+        return False
+    if stage == "approach":
+        # TCP가 픽 높이까지 내려오면 완료
+        return tool_z <= approach_z
+    if stage == "pick":
+        # 그리퍼가 닫힌 상태로 충분히 들어올렸으면 완료
+        return gripper == 1 and tool_z >= lift_z
+    if stage in ("place_left", "place_right", "place_middle", "place"):
+        # 그리퍼가 열린 상태로 들어올렸으면 완료
+        return gripper == 0 and tool_z >= lift_z
+    if stage == "return":
+        # 홈 높이까지 올라오면 완료
+        return tool_z >= home_z
+    # move_* 등 센서 조건 없는 stage → timeout에 맡김
+    return False
 
 
 def main() -> None:
@@ -152,8 +186,8 @@ def main() -> None:
     parser.add_argument("--action_scale", type=float, default=1.0, help="관절 델타 배율")
     parser.add_argument("--max_delta_deg", type=float, default=3.0,
                         help="스텝당 최대 관절 이동(도). 0=무제한")
-    parser.add_argument("--min_tool_z", type=float, default=101.0,
-                        help="안전: TCP Z(mm) 이 값 이하면 루프 중단")
+    parser.add_argument("--min_tool_z", type=float, default=80.0,
+                        help="안전: TCP Z(mm) 이 값 이하면 루프 중단 (approach_z_done보다 작게 설정)")
     parser.add_argument("--safety_hold_pose", action="store_true",
                         help="min_tool_z 도달 시 루프 중단 대신 현재 포즈 유지")
     parser.add_argument("--movj_velocity", type=int, default=70, help="MovJ 속도 0~100")
@@ -180,8 +214,8 @@ def main() -> None:
     # ── 초기 자세 ─────────────────────────────────────────────────────────────
     parser.add_argument("--no_init_pose", action="store_true",
                         help="초기 자세 이동 스킵")
-    parser.add_argument("--init_pose_version", choices=["ver1", "ver2"], default="ver1",
-                        help="초기 자세 버전")
+    parser.add_argument("--init_pose_version", choices=["ver1", "ver2", "e6_v1"], default="e6_v1",
+                        help="초기 자세 버전 (e6_v1: 학습 데이터 기준 초기 자세, 기본값)")
 
     # ── auto cycle return ↔ approach ─────────────────────────────────────────
     parser.add_argument("--auto_cycle_return_approach", action="store_true",
@@ -192,6 +226,31 @@ def main() -> None:
                         help="approach 단계 유지 시간(초)")
     parser.add_argument("--return_cycle_sec", type=float, default=2.0,
                         help="return 단계 유지 시간(초)")
+
+    # ── 센서 기반 태스크 시퀀스 (π0 env.is_episode_complete() 구조) ────────────
+    parser.add_argument(
+        "--task_sequence", default=None,
+        help=(
+            "센서 기반 태스크 시퀀스. TASK_PRESETS 키를 콤마로 구분.\n"
+            "예: approach,pick,move_left,place_left,return\n"
+            "각 stage는 센서 조건 충족 시 다음으로 전환, 미충족 시 stage_timeout_sec 후 강제 전환."
+        )
+    )
+    parser.add_argument("--approach_z_done", type=float, default=100.0,
+                        help="approach 완료: TCP Z(mm) 이하 (pick 높이)")
+    parser.add_argument("--lift_z_done", type=float, default=200.0,
+                        help="pick/place 완료: 들어올린 후 Z(mm) 이상")
+    parser.add_argument("--home_z_done", type=float, default=300.0,
+                        help="return 완료: Z(mm) 이상")
+    parser.add_argument("--stage_done_steps", type=int, default=5,
+                        help="완료 조건 연속 만족 스텝 수 (노이즈 방지)")
+    parser.add_argument("--stage_timeout_sec", type=float, default=15.0,
+                        help="stage별 timeout(초). 0=무제한")
+    parser.add_argument("--approach_j3_assist_deg", type=float, default=0.0,
+                        help=(
+                            "approach stage에서 매 스텝 Δj3에 추가하는 바이어스(도). "
+                            "z가 내려가지 않을 때 0.3~1.0 사용. 기본 0=비활성."
+                        ))
 
     # ── 로깅 ──────────────────────────────────────────────────────────────────
     parser.add_argument("--exec_log_jsonl", default=None, help="실행 로그 JSONL 경로")
@@ -214,11 +273,11 @@ def main() -> None:
     dashboard = move = feed = None
     if not args.dry_run:
         try:
-            from DobotApis.DobotApis import DobotApis  # type: ignore[import]  # noqa: PLC0415
+            from dobot_api import DobotApiDashboard, DobotApiMove, DobotApiFeedBack  # noqa: PLC0415
             print(f"[2/3] 로봇 연결: {args.robot_ip}")
-            dashboard = DobotApis.DashboardApis(args.robot_ip, 29999)
-            move = DobotApis.MoveApis(args.robot_ip, 30004)
-            feed = DobotApis.FeedBackApis(args.robot_ip, 30005)
+            dashboard = DobotApiDashboard(args.robot_ip, 29999)
+            move = DobotApiMove(args.robot_ip, 30004)
+            feed = DobotApiFeedBack(args.robot_ip, 30005)
             dashboard.EnableRobot()
             time.sleep(0.5)
             print("      EnableRobot 완료")
@@ -237,6 +296,7 @@ def main() -> None:
     # ── 2.5) 초기 자세 ───────────────────────────────────────────────────────
     if not args.no_init_pose and dashboard is not None:
         INIT_POSES: dict[str, list[float]] = {
+            "e6_v1": [90.128, 42.907, 59.355, -11.702, -87.582, 177.813],  # 학습 데이터 초기 자세
             "ver1": [0.0, 0.0, 90.0, 0.0, 90.0, 0.0],
             "ver2": [-0.16, -43.88, 79.66, -2.49, 54.22, -0.15],
         }
@@ -271,6 +331,23 @@ def main() -> None:
     task_result = "RUNNING"
     task_done_reason = ""
 
+    # ── 센서 기반 태스크 시퀀스 초기화 ──────────────────────────────────────────
+    _task_seq: list[str] | None = None
+    _seq_idx: int = 0
+    stage_done_streak: int = 0
+    loop_tool_z: float | None = None  # 이전 iteration에서 읽은 TCP Z (stage 판정에 사용)
+    _V1_CORE = {"approach", "pick", "move_left", "move_right", "move_middle",
+                "place_left", "place_right", "place_middle"}
+    if args.task_sequence:
+        _task_seq = [s.strip() for s in args.task_sequence.split(",")]
+        first = _task_seq[0]
+        args.prompt = TASK_PRESETS.get(first, first)
+        stage_name = _stage_from_prompt(args.prompt)
+        ood = [t for t in _task_seq if t not in _V1_CORE]
+        if ood:
+            print(f"[WARN] task_sequence에 학습 미포함(OOD) stage 있음: {ood} — 동작 보장 없음")
+        print(f"[SEQ] 태스크 시퀀스: {_task_seq}")
+
     steps_per_inference = args.steps_per_inference  # None → will use chunk length
 
     if args.save_frames_dir:
@@ -289,8 +366,48 @@ def main() -> None:
                 print(f"[TASK_DONE] {task_result} {task_done_reason}")
                 break
 
-            # ── auto cycle return ↔ approach ────────────────────────────────
-            if args.auto_cycle_return_approach and stage_name in {"approach", "return"}:
+            # ── 센서 기반 stage 완료 판정 (π0 env.is_episode_complete() 구조) ────
+            if _task_seq is not None:
+                if _stage_complete(
+                    stage_name, loop_tool_z, last_tool_on,
+                    args.approach_z_done, args.lift_z_done, args.home_z_done,
+                ):
+                    stage_done_streak += 1
+                else:
+                    stage_done_streak = 0
+
+                stage_timed_out = args.stage_timeout_sec > 0 and stage_elapsed > args.stage_timeout_sec
+                stage_ok = stage_done_streak >= args.stage_done_steps
+
+                if stage_ok or stage_timed_out:
+                    reason = "done" if stage_ok else "timeout"
+                    z_str = f"{loop_tool_z:.1f}mm" if loop_tool_z is not None else "N/A"
+                    _seq_idx += 1
+                    if _seq_idx >= len(_task_seq):
+                        task_result = "SUCCESS"
+                        task_done_reason = "sequence complete"
+                        print(f"[TASK_DONE] {task_result} ({reason}) z={z_str} step={step}")
+                        break
+                    next_task = _task_seq[_seq_idx]
+                    next_prompt = TASK_PRESETS.get(next_task, next_task)
+                    next_stage = _stage_from_prompt(next_prompt)
+                    print(
+                        f"[STAGE_SWITCH] {stage_name}→{next_stage} ({reason}) "
+                        f"z={z_str} gripper={last_tool_on} step={step}"
+                    )
+                    args.prompt = next_prompt
+                    stage_name = next_stage
+                    stage_start_mono = time.monotonic()
+                    stage_elapsed = 0.0
+                    stage_done_streak = 0
+                    current_chunk = None
+                    chunk_index = 0
+                    task_result = "RUNNING"
+                    task_done_reason = ""
+                    continue
+
+            # ── auto cycle return ↔ approach (하위 호환, task_sequence 미사용 시) ─
+            elif args.auto_cycle_return_approach and stage_name in {"approach", "return"}:
                 limit = args.approach_cycle_sec if stage_name == "approach" else args.return_cycle_sec
                 if limit > 0 and stage_elapsed > limit:
                     if stage_name == "approach":
@@ -336,14 +453,10 @@ def main() -> None:
                 if feed is not None:
                     try:
                         fb = feed.feedBackData()
-                        if isinstance(fb, dict):
-                            q = fb["QActual"][0]
-                        else:
-                            arr = np.asarray(fb, dtype=object)
-                            q = arr[0][17] if arr.size else [0] * 7
-                        deg = np.asarray(q, dtype=np.float32).ravel()
-                        n = min(6, deg.size)
-                        joint_7[:n] = np.deg2rad(deg[:n])
+                        if fb is not None:
+                            deg = np.asarray(fb["QActual"][0], dtype=np.float32).ravel()
+                            n = min(6, deg.size)
+                            joint_7[:n] = np.deg2rad(deg[:n])
                     except Exception as exc:
                         print(f"  피드백 읽기 실패: {exc}")
 
@@ -388,10 +501,10 @@ def main() -> None:
                     if feed is not None:
                         try:
                             fb = feed.feedBackData()
-                            q = fb["QActual"][0] if isinstance(fb, dict) else (np.asarray(fb, dtype=object)[0][17] if np.asarray(fb, dtype=object).size else [0]*6)
-                            deg6 = np.asarray(q, dtype=np.float32).ravel()[:6]
-                        except Exception:
-                            pass
+                            if fb is not None:
+                                deg6 = np.asarray(fb["QActual"][0], dtype=np.float32).ravel()[:6]
+                        except Exception as exc:
+                            print(f"  피드백 읽기 실패: {exc}")
                     state_7 = np.concatenate([deg6, [current_gripper]], dtype=np.float32)
                     obs = {
                         "observation/exterior_image_1_left": obs_img,
@@ -447,35 +560,19 @@ def main() -> None:
             if feed is not None:
                 try:
                     fb = feed.feedBackData()
-                    if isinstance(fb, dict):
+                    if fb is not None:
                         current_joints_deg = np.asarray(fb["QActual"][0], dtype=np.float32).ravel()
-                        tv = fb.get("ToolVectorActual")
-                        if tv is not None:
-                            tv = np.asarray(tv[0], dtype=np.float32)
-                            current_tool_z = float(tv[2])
-                            if ref_tool_vec is None:
-                                ref_tool_vec = tv.copy()
-                    else:
-                        arr = np.asarray(fb, dtype=object)
-                        if arr.size:
-                            tup = arr[0]
-                            try:
-                                current_joints_deg = np.asarray(tup[17], dtype=np.float32).ravel()
-                            except Exception:
-                                pass
-                            try:
-                                tv = np.asarray(tup[26], dtype=np.float32).ravel()
-                                current_tool_z = float(tv[2])
-                                if ref_tool_vec is None:
-                                    ref_tool_vec = tv.copy()
-                            except Exception:
-                                pass
+                        tv = np.asarray(fb["ToolVectorActual"][0], dtype=np.float32).ravel()
+                        current_tool_z = float(tv[2])
+                        loop_tool_z = current_tool_z  # 다음 iteration stage 판정에 사용
+                        if ref_tool_vec is None:
+                            ref_tool_vec = tv.copy()
                     if current_joints_deg is not None:
                         current_joints_rad = np.deg2rad(current_joints_deg)
                         if ref_joints_deg is None:
                             ref_joints_deg = current_joints_deg.copy()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    print(f"  피드백 읽기 실패: {exc}")
 
             # ── 관절 델타 계산 ───────────────────────────────────────────────
             if args.input_layout == "e6_v1":
@@ -498,6 +595,14 @@ def main() -> None:
 
             if args.max_delta_deg > 0:
                 delta_deg = np.clip(delta_deg, -args.max_delta_deg, args.max_delta_deg)
+
+            # ── approach j3 assist (모델이 내려가지 않을 때 j3 바이어스 추가) ──────
+            if args.approach_j3_assist_deg != 0.0 and stage_name == "approach":
+                if loop_tool_z is None or loop_tool_z > args.approach_z_done:
+                    delta_deg = delta_deg.copy()
+                    delta_deg[2] += args.approach_j3_assist_deg
+                    if args.max_delta_deg > 0:
+                        delta_deg = np.clip(delta_deg, -args.max_delta_deg, args.max_delta_deg)
 
             execute_motion = True
             if current_joints_deg is None:
@@ -550,14 +655,15 @@ def main() -> None:
             if camera_hold:
                 tool_on = last_tool_on
 
-            # ── 디버그 출력 (첫 10스텝 + 이후 50마다) ────────────────────────
-            dbg = step < 10 or step % 50 == 0
+            # ── 디버그 출력 (첫 10스텝 + 이후 50마다; approach는 5스텝마다) ──────
+            _in_approach = (stage_name == "approach")
+            dbg = step < 10 or step % 50 == 0 or (_in_approach and step % 5 == 0)
             if dbg:
                 j_str = [f"{x:.2f}" for x in target_joints_deg] if execute_motion else ["N/A"] * 6
+                z_str = f"z={current_tool_z:.1f}mm" if current_tool_z is not None else "z=N/A"
                 print(
                     f"  [step={step}] Δ(deg)=[{','.join(f'{x:.3f}' for x in delta_deg)}] "
-                    f"target=[{','.join(j_str)}] grip={grip_raw:.3f}→{tool_on} "
-                    f"z={current_tool_z:.1f}mm" if current_tool_z else ""
+                    f"target=[{','.join(j_str)}] grip={grip_raw:.3f}→{tool_on} {z_str}"
                 )
 
             # ── 로봇 명령 전송 ───────────────────────────────────────────────

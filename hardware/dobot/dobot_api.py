@@ -147,11 +147,12 @@ class DobotApi:
             print(text)
 
     def send_data(self, string):
-       # self.log(f"Send to {self.ip}:{self.port}: {string}")
-        try:
+        if DOBOT_DEBUG:
             print(f"Send to {self.ip}:{self.port}: {string}")
+        try:
             self.socket_dobot.send(str.encode(string, 'utf-8'))
-            print(f"Send to {self.ip}:{self.port}: {string} success")
+            if DOBOT_DEBUG:
+                print(f"Send to {self.ip}:{self.port}: {string} success")
         except Exception as e:
             print(e)
             while True:
