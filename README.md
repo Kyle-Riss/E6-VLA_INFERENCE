@@ -5,6 +5,8 @@ Dobot E6 로봇 팔을 위한 π0.5 VLA(Vision-Language-Action) 추론 파이프
 
 ## 아키텍처
 
+### 단일 스크립트 모드 (기본)
+
 ```
 [serve_policy.py]  ←── WebSocket ──→  [run_e6_client.py]  ──→  Dobot E6
   정책 서버 (π0.5 추론)                  로봇 제어 클라이언트       192.168.5.1
@@ -12,6 +14,20 @@ Dobot E6 로봇 팔을 위한 π0.5 VLA(Vision-Language-Action) 추론 파이프
 
 - **serve_policy.py** — 체크포인트를 로드해 WebSocket으로 obs → actions 서빙
 - **run_e6_client.py** — 카메라 + 로봇 상태 수집 → 서버로 전송 → MovJ / ToolDO 실행
+
+### ROS2 모드 (`feature/ros2-integration`)
+
+```
+[serve_policy.py]  ←── WebSocket ──→  [inference_bridge_node]
+                                       [camera_state_node]      ──→  Dobot E6
+                                       [executor_supervisor_node]
+                                       [task_node]
+```
+
+- 추론 중에도 로봇이 이전 chunk로 계속 동작 (비블로킹)
+- 안전 감시 / 긴급 정지 서비스 독립 실행
+- task_sequence 상태머신으로 stage 자동 전환
+- 상세: [ROS2 플로우차트](docs/ROS2_FLOWCHART.md) / [ROS2 아키텍처](docs/ROS2_ARCHITECTURE.md)
 
 ## 요구 환경
 
@@ -111,10 +127,21 @@ e6-vla/
 │   ├── camera_capture.py              # HIKRobot MVS 카메라
 │   ├── dobot/dobot_api.py             # Dobot E6 TCP 제어
 │   └── utils/                         # 연결 테스트 유틸
+├── ros2/                              # ROS2 파이프라인 (feature/ros2-integration)
+│   └── src/e6_vla_ros/
+│       ├── e6_vla_ros/
+│       │   ├── camera_state_node.py       # HIKRobot + feedBack 20Hz 발행
+│       │   ├── inference_bridge_node.py   # obs 조립 + WebSocket 추론
+│       │   ├── executor_supervisor_node.py# MovJ/ToolDO + 안전 감시
+│       │   └── task_node.py               # task_sequence 상태머신
+│       └── launch/e6_vla.launch.py        # 전체 런치
 ├── src/openpi/                        # 모델 아키텍처 (serve_policy 의존)
 ├── packages/openpi-client/            # WebSocket 클라이언트
 ├── setup/                             # Jetson 환경 설정 스크립트
-└── docs/                              # USAGE.md 등 상세 문서
+└── docs/                              # 상세 문서
+    ├── ROS2_FLOWCHART.md              # ROS2 파이프라인 플로우차트
+    ├── ROS2_ARCHITECTURE.md           # ROS2 아키텍처 설계
+    └── ROS2_IMPLEMENTATION_PLAN.md    # ROS2 구현 계획
 ```
 
 ## 상세 문서
@@ -122,6 +149,8 @@ e6-vla/
 - [전체 사용 가이드](docs/USAGE.md)
 - [추론 파이프라인](docs/INFERENCE.md)
 - [로봇 추론 가이드](docs/ROBOT_INFERENCE.md)
+- [ROS2 플로우차트](docs/ROS2_FLOWCHART.md)
+- [ROS2 아키텍처](docs/ROS2_ARCHITECTURE.md)
 
 ## 관련 레포
 
