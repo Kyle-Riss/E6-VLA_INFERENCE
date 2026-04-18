@@ -206,8 +206,8 @@ class ExecutorSupervisorNode(Node):
         if hasattr(self, "_frame_mean") and self._frame_mean < self._black_mean:
             delta_deg[:] = 0.0
 
-        # 목표 관절각
-        target_deg = self._current_deg[:6] + delta_deg
+        # 목표 관절각 (action = 절대 next-position, delta 가산 아님)
+        target_deg = delta_deg
 
         # 그리퍼 hysteresis
         grip_raw = float(a[6]) if len(a) > 6 else 0.0
