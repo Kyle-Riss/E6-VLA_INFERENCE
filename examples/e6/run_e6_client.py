@@ -609,7 +609,7 @@ def main() -> None:
                 execute_motion = False
                 target_joints_deg = np.zeros(6, dtype=np.float32)
             else:
-                target_joints_deg = current_joints_deg[:6] + delta_deg
+                target_joints_deg = delta_deg  # action = 절대 next-position (degree), delta 가산 아님
 
             # ── Z 안전 한계 ──────────────────────────────────────────────────
             if current_tool_z is not None and current_tool_z <= args.min_tool_z:
