@@ -123,8 +123,8 @@ class ExecutorSupervisorNode(Node):
         if not self._dry_run:
             self._init_robot(robot_ip)
 
-        # 타이머
-        self.create_timer(0.05,  self._executor_tick)   # 20Hz
+        # 타이머 (학습 데이터 수집 주파수 18Hz에 맞춤)
+        self.create_timer(1/18,  self._executor_tick)   # 18Hz
         self.create_timer(0.10,  self._supervisor_tick) # 10Hz
 
         self.get_logger().info(

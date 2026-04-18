@@ -172,7 +172,7 @@ def main() -> None:
     )
 
     # ── 제어 루프 ─────────────────────────────────────────────────────────────
-    parser.add_argument("--hz", type=float, default=20.0, help="제어 주파수 (기본 20 Hz)")
+    parser.add_argument("--hz", type=float, default=18.0, help="제어 주파수 (학습 데이터 수집 주파수 18Hz에 맞춤)")
     parser.add_argument(
         "--steps_per_inference", type=int, default=None,
         help="청크에서 몇 스텝 실행 후 재추론. None=action_horizon 전체"
