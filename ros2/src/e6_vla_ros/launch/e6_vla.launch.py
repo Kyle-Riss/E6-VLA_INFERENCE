@@ -13,10 +13,11 @@ def generate_launch_description():
         DeclareLaunchArgument("task_sequence",  default_value="approach"),
         DeclareLaunchArgument("stage_timeout_sec", default_value="0.0"),
         DeclareLaunchArgument("loop_sequence",  default_value="false"),
-        DeclareLaunchArgument("dry_run",        default_value="false"),
-        DeclareLaunchArgument("no_camera",      default_value="false"),
-        DeclareLaunchArgument("max_delta_deg",  default_value="3.0"),
-        DeclareLaunchArgument("min_tool_z",     default_value="101.0"),
+        DeclareLaunchArgument("dry_run",             default_value="false"),
+        DeclareLaunchArgument("no_camera",           default_value="false"),
+        DeclareLaunchArgument("max_delta_deg",       default_value="3.0"),
+        DeclareLaunchArgument("min_tool_z",          default_value="101.0"),
+        DeclareLaunchArgument("steps_per_inference", default_value="8"),
 
         # ── 노드 1: camera_state_node ──────────────────────────────────────
         Node(
@@ -53,8 +54,9 @@ def generate_launch_description():
                 "robot_ip":      LaunchConfiguration("robot_ip"),
                 "dry_run":       LaunchConfiguration("dry_run"),
                 "no_camera":     LaunchConfiguration("no_camera"),
-                "max_delta_deg": LaunchConfiguration("max_delta_deg"),
-                "min_tool_z":    LaunchConfiguration("min_tool_z"),
+                "max_delta_deg":       LaunchConfiguration("max_delta_deg"),
+                "min_tool_z":          LaunchConfiguration("min_tool_z"),
+                "steps_per_inference": LaunchConfiguration("steps_per_inference"),
             }],
         ),
 

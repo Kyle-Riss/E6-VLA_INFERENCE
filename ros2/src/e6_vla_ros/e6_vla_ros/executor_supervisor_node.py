@@ -26,6 +26,7 @@ executor_supervisor_node — 액션 실행 + 안전 감시
   movj_velocity         (int,   default 70)
   movj_accel            (int,   default 60)
   chunk_staleness_sec   (float, default 5.0)
+  steps_per_inference   (int,   default 8)    — 청크에서 실행할 스텝 수 (0=전체)
   bad_camera_consecutive(int,   default 10)
   camera_black_mean     (float, default 8.0)
 """
@@ -72,6 +73,7 @@ class ExecutorSupervisorNode(Node):
         self.declare_parameter("movj_velocity", 70)
         self.declare_parameter("movj_accel", 60)
         self.declare_parameter("chunk_staleness_sec", 5.0)
+        self.declare_parameter("steps_per_inference", 8)
         self.declare_parameter("bad_camera_consecutive", 10)
         self.declare_parameter("camera_black_mean", 8.0)
 
@@ -85,6 +87,8 @@ class ExecutorSupervisorNode(Node):
         self._movj_v = self.get_parameter("movj_velocity").value
         self._movj_a = self.get_parameter("movj_accel").value
         self._staleness_sec = self.get_parameter("chunk_staleness_sec").value
+        _spi = self.get_parameter("steps_per_inference").value
+        self._steps_per_inference = _spi if _spi > 0 else ACTION_HORIZON
         self._bad_cam_limit = self.get_parameter("bad_camera_consecutive").value
         self._black_mean = self.get_parameter("camera_black_mean").value
 
@@ -130,7 +134,8 @@ class ExecutorSupervisorNode(Node):
         self.get_logger().info(
             f"executor_supervisor_node 시작 — "
             f"robot={'연결됨' if self._dashboard else 'dry_run'} "
-            f"max_delta={self._max_delta}° min_tool_z={self._min_tool_z}mm"
+            f"max_delta={self._max_delta}° min_tool_z={self._min_tool_z}mm "
+            f"steps_per_inference={self._steps_per_inference}/{ACTION_HORIZON}"
         )
 
     # ── 초기화 ──────────────────────────────────────────────────────────────
@@ -154,7 +159,7 @@ class ExecutorSupervisorNode(Node):
             self.get_logger().warn(f"chunk 크기 이상: {data.size}")
             return
         with self._chunk_lock:
-            self._chunk = data.reshape(ACTION_HORIZON, ACTION_DIM)
+            self._chunk = data.reshape(ACTION_HORIZON, ACTION_DIM)[:self._steps_per_inference]
             self._chunk_idx = 0
             self._chunk_t = time.monotonic()
 
