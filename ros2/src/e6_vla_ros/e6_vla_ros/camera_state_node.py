@@ -3,10 +3,10 @@
 camera_state_node — HIKRobot 카메라 + ZED 카메라 + Dobot feedBack 읽기
 
 발행 토픽:
-  /e6/camera/image        sensor_msgs/Image          20Hz  224x224 RGB  (HIK)
-  /e6/camera/zed_image    sensor_msgs/Image          20Hz  224x224 RGB  (ZED left)
-  /e6/robot/state         std_msgs/Float32MultiArray 20Hz  [j1..j6 deg, gripper 0~1]
-  /e6/robot/tcp_z         std_msgs/Float32           20Hz  TCP Z (mm)
+  /e6/camera/image        sensor_msgs/Image          18Hz  224x224 RGB  (HIK)
+  /e6/camera/zed_image    sensor_msgs/Image          18Hz  224x224 RGB  (ZED left)
+  /e6/robot/state         std_msgs/Float32MultiArray 18Hz  [j1..j6 deg, gripper 0~1]
+  /e6/robot/tcp_z         std_msgs/Float32           18Hz  TCP Z (mm)
 
 파라미터:
   robot_ip   (str,  default "192.168.5.1")
@@ -81,8 +81,8 @@ class CameraStateNode(Node):
             self._init_camera()
             self._init_zed()
 
-        # 20Hz 타이머
-        self.create_timer(0.05, self._tick)
+        # 18Hz 타이머
+        self.create_timer(1/18, self._tick)
         self.get_logger().info(
             f"camera_state_node 시작 — robot={'연결됨' if self._feed else 'dry_run'} "
             f"camera={'연결됨' if self._camera else 'dummy'}"
@@ -129,7 +129,7 @@ class CameraStateNode(Node):
             self._zed = None
             self._zed_mat = None
 
-    # ── 20Hz 타이머 ─────────────────────────────────────────────────────────
+    # ── 18Hz 타이머 ─────────────────────────────────────────────────────────
 
     def _tick(self):
         now = self.get_clock().now().to_msg()

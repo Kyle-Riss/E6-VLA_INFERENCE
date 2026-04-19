@@ -22,9 +22,9 @@
     │                                   │  - MovJ / ToolDO 실행        │
     │ 구독                              │  - bad_camera 감시           │
     │                                   │  - min_tool_z 감시           │
-    │ /e6/camera/image     (20Hz)       │  - emergency_stop 서비스     │
-    │ /e6/camera/zed_image (20Hz)       └──────────────┬───────────────┘
-    │ /e6/robot/state      (20Hz)                       │
+    │ /e6/camera/image     (18Hz)       │  - emergency_stop 서비스     │
+    │ /e6/camera/zed_image (18Hz)       └──────────────┬───────────────┘
+    │ /e6/robot/state      (18Hz)                       │
     │ /e6/task/prompt      (이벤트)                     │ /e6/supervisor/status
     │                                                  │ (RUNNING / STAGE_DONE / FAIL_*)
     │         ┌────────────────────────┐               │
@@ -32,7 +32,7 @@
     │         │  - HIKRobot 224x224    │   ┌────────────────────────────┐
     │         │  - ZED 224x224 (left)  │   │         task_node          │
     │         │  - Dobot feedBack      │   │  - task_sequence 상태머신  │
-    │         │  - 20Hz 타이머         │   │  - STAGE_DONE 받으면       │
+    │         │  - 18Hz 타이머         │   │  - STAGE_DONE 받으면       │
     │         └──────────┬─────────────┘   │    다음 stage로 전환        │
     │                    │                 │  - /e6/task/prompt 발행    │
     │ /e6/camera/image   │                 └────────────────────────────┘
@@ -96,7 +96,7 @@
 ## 타이밍
 
 ```
-t=0ms      camera_state_node 20Hz 타이머
+t=0ms      camera_state_node 18Hz 타이머
            → /e6/camera/image     발행  (HIK)
            → /e6/camera/zed_image 발행  (ZED left)
            → /e6/robot/state      발행
@@ -112,10 +112,10 @@ t=1600ms   inference_bridge_node 결과 수신
 
 t=1600ms   executor_supervisor_node chunk 교체, index=0 리셋
 
-t=1650ms   executor_timer (20Hz) → chunk[0] → MovJ
+t=1650ms   executor_timer (18Hz) → chunk[0] → MovJ
 t=1700ms                          → chunk[1] → MovJ
 ...
-t=2400ms                          → chunk[15] → MovJ (16/20Hz = 0.8초)
+t=2400ms                          → chunk[15] → MovJ (16/18Hz ≈ 0.89초)
 
            → 다음 추론 트리거 (최신 obs 사용)
 ```

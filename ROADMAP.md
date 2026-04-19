@@ -23,7 +23,7 @@
 - `pi05_e6_v1_lora` config (E6Inputs, 7D degree, action_horizon=16)
 
 ### ✅ ROS2 4노드 구현 (feature/ros2-integration)
-- **camera_state_node** — HIKRobot + ZED X (2채널) + Dobot feedBack 20Hz 발행
+- **camera_state_node** — HIKRobot + ZED X (2채널) + Dobot feedBack 18Hz 발행
 - **inference_bridge_node** — obs 조립 (HIK + ZED) + WebSocket 비블로킹 추론
 - **executor_supervisor_node** — MovJ/ToolDO 실행 + 안전 감시
 - **task_node** — task_sequence 상태머신 + prompt 관리
@@ -48,8 +48,8 @@
 # HIKRobot + ZED 연결 후
 ros2 launch e6_vla_ros e6_vla.launch.py dry_run:=true task_sequence:="approach"
 # → 두 카메라 토픽 정상 발행 확인
-ros2 topic hz /e6/camera/image       # 20Hz 나와야 함
-ros2 topic hz /e6/camera/zed_image   # 20Hz 나와야 함
+ros2 topic hz /e6/camera/image       # 18Hz 나와야 함
+ros2 topic hz /e6/camera/zed_image   # 18Hz 나와야 함
 ```
 
 #### 2. 로봇 연결 테스트
@@ -148,7 +148,7 @@ e6-vla/
 ├── ros2/
 │   └── src/e6_vla_ros/
 │       ├── e6_vla_ros/
-│       │   ├── camera_state_node.py       # HIKRobot + ZED X + feedBack 20Hz
+│       │   ├── camera_state_node.py       # HIKRobot + ZED X + feedBack 18Hz
 │       │   ├── inference_bridge_node.py   # obs 조립 (2채널) + WebSocket 추론
 │       │   ├── executor_supervisor_node.py# MovJ/ToolDO + 안전 감시
 │       │   ├── task_node.py               # task_sequence 상태머신

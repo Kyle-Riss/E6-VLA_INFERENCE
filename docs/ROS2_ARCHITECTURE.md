@@ -86,7 +86,7 @@ e6-vla/
 - HIKRobot (`hardware/camera_capture.py`) → `/e6/camera/image`
 - ZED X (`pyzed.sl`) → `/e6/camera/zed_image` (left eye, 224×224 RGB)
 - Dobot `feedBackData()` → `/e6/robot/state` [j1..j6 deg, gripper], `/e6/robot/tcp_z`
-- 20Hz 타이머, 이미지 encoding `rgb8`
+- 18Hz 타이머, 이미지 encoding `rgb8`
 - `no_camera=true` 시 두 카메라 모두 zeros 발행 (graceful degradation)
 - `dry_run=true` 시 로봇 상태 zeros 발행
 
@@ -102,7 +102,7 @@ e6-vla/
 
 ### executor_node
 - `/e6/policy/action_chunk` 수신 시 청크 갱신
-- 20Hz 타이머 → `chunk[index]` 꺼내서 MovJ / ToolDO 실행
+- 18Hz 타이머 → `chunk[index]` 꺼내서 MovJ / ToolDO 실행
 - `max_delta_deg` 클리핑, staleness 체크
 
 ### supervisor_node
@@ -152,7 +152,7 @@ ros2 run e6_vla_ros robot_state_node
 
 ### 완료된 변경
 
-- `camera_state_node.py` — ZED 초기화 + `/e6/camera/zed_image` 20Hz 발행
+- `camera_state_node.py` — ZED 초기화 + `/e6/camera/zed_image` 18Hz 발행
 - `inference_bridge_node.py` — `/e6/camera/zed_image` 구독, obs에 `exterior_image_2_left` 포함
 - `e6_policy.py` — `E6Inputs` 2채널 처리, `image_mask` 둘 다 `True`
 - `config.py` — `LeRobotE6DataConfig` `exterior_image_2_left` 매핑 추가
