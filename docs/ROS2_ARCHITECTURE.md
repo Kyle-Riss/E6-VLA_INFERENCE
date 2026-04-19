@@ -13,9 +13,10 @@
 ┌──────────────────────────────────────────────────────────────────────┐
 │                           ROS2 영역 (e6_vla_ros)                     │
 │                                                                      │
-│  [camera_node] ──── /e6/camera/image ─────────────────────┐         │
+│  [camera_state_node] ── /e6/camera/image ─────────────────┐
+                    └── /e6/camera/zed_image ──────────────┤         │
 │                                                           │         │
-│  [robot_state_node] ─ /e6/robot/state ────────────────────┤         │
+│  [camera_state_node] ─ /e6/robot/state ───────────────────┤         │
 │                       /e6/robot/tcp_z                     ▼         │
 │  [task_node] ──────── /e6/task/prompt ──────> [inference_bridge_node]│
 │                                          obs 조립 → WebSocket 질의  │
@@ -51,12 +52,11 @@ e6-vla/
             │   └── e6_vla.launch.py
             └── e6_vla_ros/
                 ├── __init__.py
-                ├── camera_node.py
-                ├── robot_state_node.py
-                ├── task_node.py
+                ├── camera_state_node.py
                 ├── inference_bridge_node.py
-                ├── executor_node.py
-                └── supervisor_node.py
+                ├── executor_supervisor_node.py
+                ├── task_node.py
+                └── __init__.py
 ```
 
 ---
@@ -65,9 +65,10 @@ e6-vla/
 
 | 토픽 | 타입 | 발행 노드 | Hz | 설명 |
 |------|------|----------|----|------|
-| `/e6/camera/image` | `sensor_msgs/Image` | camera_node | 20 | 224×224 RGB uint8 |
-| `/e6/robot/state` | `std_msgs/Float32MultiArray` | robot_state_node | 20 | [j1..j6 deg, gripper 0\~1] |
-| `/e6/robot/tcp_z` | `std_msgs/Float32` | robot_state_node | 20 | TCP Z(mm) |
+| `/e6/camera/image` | `sensor_msgs/Image` | camera_state_node | 20 | 224×224 RGB uint8 — HIKRobot |
+| `/e6/camera/zed_image` | `sensor_msgs/Image` | camera_state_node | 20 | 224×224 RGB uint8 — ZED left |
+| `/e6/robot/state` | `std_msgs/Float32MultiArray` | camera_state_node | 20 | [j1..j6 deg, gripper 0\~1] |
+| `/e6/robot/tcp_z` | `std_msgs/Float32` | camera_state_node | 20 | TCP Z(mm) |
 | `/e6/task/prompt` | `std_msgs/String` | task_node | 이벤트 | QoS transient_local |
 | `/e6/policy/action_chunk` | `std_msgs/Float32MultiArray` | inference_bridge_node | ~1 | 16×7 flatten |
 | `/e6/supervisor/status` | `std_msgs/String` | supervisor_node | 10 | RUNNING / STAGE_DONE:approach / FAIL_SAFETY / … |
@@ -81,15 +82,13 @@ e6-vla/
 
 ## 노드별 핵심 책임
 
-### camera_node
-- `hardware/camera_capture.py` 재사용 (HIKRobot / OpenCV fallback)
-- 20Hz 타이머 → `sensor_msgs/Image` publish
-- 이미지 224×224 RGB uint8 → encoding `rgb8`
-
-### robot_state_node
-- Dobot `feedBackData()` → joint deg 6D
-- `GetToolDO(1)` → gripper 0/1
-- state = `[j1, j2, j3, j4, j5, j6, gripper]` float32 7D
+### camera_state_node
+- HIKRobot (`hardware/camera_capture.py`) → `/e6/camera/image`
+- ZED X (`pyzed.sl`) → `/e6/camera/zed_image` (left eye, 224×224 RGB)
+- Dobot `feedBackData()` → `/e6/robot/state` [j1..j6 deg, gripper], `/e6/robot/tcp_z`
+- 20Hz 타이머, 이미지 encoding `rgb8`
+- `no_camera=true` 시 두 카메라 모두 zeros 발행 (graceful degradation)
+- `dry_run=true` 시 로봇 상태 zeros 발행
 
 ### task_node
 - `--task_sequence "approach,pick,move_left,place_left"` 파라미터
@@ -139,50 +138,24 @@ ros2 run e6_vla_ros robot_state_node
 
 ---
 
-## ⚠️ 필수 확장 계획: ZED X 스테레오 카메라 추가
+## ✅ ZED X 스테레오 카메라 추가 (완료)
 
-> **이 항목은 반드시 구현해야 합니다.**
+2채널 카메라 파이프라인 구현 완료.
 
-현재 파이프라인은 탑뷰 카메라 **1채널**만 사용합니다 (`observation/exterior_image_1_left`).  
-추후 **ZED X 카메라를 추가하여 이미지를 2채널로 확장**할 계획입니다.
+### obs 구조
 
-### 목표 obs 구조 (ZED X 추가 후)
+| 키 | 카메라 | ROS2 토픽 | 모델 슬롯 |
+|----|--------|----------|----------|
+| `observation/exterior_image_1_left` | HIKRobot 탑뷰 | `/e6/camera/image` | `base_0_rgb` |
+| `observation/exterior_image_2_left` | ZED X (left eye) | `/e6/camera/zed_image` | `left_wrist_0_rgb` |
+| `observation/state` | Dobot feedBack | `/e6/robot/state` | — |
 
-| 키 | 현재 | ZED X 추가 후 |
-|----|------|--------------|
-| `observation/exterior_image_1_left` | HIKRobot 탑뷰 | HIKRobot 탑뷰 (유지) |
-| `observation/exterior_image_1_right` | ❌ 없음 | **ZED X 좌/우 중 하나** |
-| `observation/state` | (7,) deg | (7,) deg (동일) |
+### 완료된 변경
 
-또는 ZED X를 탑뷰 단독으로 교체하거나 와이드/클로즈업 시점 2채널로 구성할 수 있음.  
-최종 채널 배치는 **학습 데이터 수집 시 사용한 카메라 배치와 반드시 일치**해야 합니다.
-
-### camera_node 확장 포인트
-
-```
-/e6/camera/image          ← 현재 (HIKRobot 탑뷰)
-/e6/camera/image_zed      ← 추가 예정 (ZED X)
-```
-
-`inference_bridge_node`의 obs 조립 시 두 이미지를 모두 사용:
-
-```python
-# ZED X 추가 후 obs 예시
-obs = {
-    "observation/exterior_image_1_left":  hik_img,   # HIKRobot
-    "observation/exterior_image_1_right": zed_img,   # ZED X
-    "observation/state":                  state_7,
-    "prompt":                             prompt,
-}
-```
-
-### 체크리스트
-
-- [ ] ZED X SDK (`pyzed`) Jetson 설치 확인
-- [ ] `camera_node.py`에 ZED X 토픽 추가 (`/e6/camera/image_zed`)
-- [ ] 학습 시 2채널 obs 계약 확정 (`e6_policy.py` `E6Inputs` 수정)
-- [ ] `inference_bridge_node.py` obs 조립 2채널로 업데이트
-- [ ] 2채널 기준으로 데이터 재수집 및 재학습
+- `camera_state_node.py` — ZED 초기화 + `/e6/camera/zed_image` 20Hz 발행
+- `inference_bridge_node.py` — `/e6/camera/zed_image` 구독, obs에 `exterior_image_2_left` 포함
+- `e6_policy.py` — `E6Inputs` 2채널 처리, `image_mask` 둘 다 `True`
+- `config.py` — `LeRobotE6DataConfig` `exterior_image_2_left` 매핑 추가
 
 ---
 

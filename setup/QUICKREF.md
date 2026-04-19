@@ -11,15 +11,10 @@ source ~/move-one/min-imum/move-one/bin/activate
 python -c "from openpi.training import config; print('SUCCESS: OpenPi OK')"
 ```
 
-### serve_policy.py 실행 (서버)
+### 정책 서버 실행 (run_server.sh)
 ```bash
-source ~/move-one/min-imum/move-one/bin/activate
-PYTHONPATH=~/e6-vla/src \
-python ~/e6-vla/scripts/serve_policy.py \
-  --port 8000 \
-  policy:checkpoint \
-  --policy.config pi0_e6_freeze_vlm_primitive_176_local \
-  --policy.dir /path/to/checkpoint/35000
+bash ~/e6-vla/run_server.sh \
+  ~/checkpoints/pi05_e6_v1_lora/e6_2cam_lora_v1_pytorch/31999_pytorch
 ```
 
 ### run_e6_client.py 실행 (클라이언트)
@@ -28,6 +23,13 @@ source ~/move-one/min-imum/move-one/bin/activate
 python ~/e6-vla/examples/e6/run_e6_client.py \
   --server_host 127.0.0.1 \
   --robot_ip 192.168.5.1 \
+  --prompt "approach red object"
+
+# 로봇/카메라 없이 추론값만 확인
+python ~/e6-vla/examples/e6/run_e6_client.py \
+  --server_host 127.0.0.1 \
+  --dry_run \
+  --show_actions \
   --prompt "approach red object"
 ```
 

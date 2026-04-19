@@ -22,20 +22,22 @@
     │                                   │  - MovJ / ToolDO 실행        │
     │ 구독                              │  - bad_camera 감시           │
     │                                   │  - min_tool_z 감시           │
-    │ /e6/camera/image (20Hz)           │  - emergency_stop 서비스     │
-    │ /e6/robot/state  (20Hz)           └──────────────┬───────────────┘
-    │ /e6/task/prompt  (이벤트)                         │
-    │                                                  │ /e6/supervisor/status
+    │ /e6/camera/image     (20Hz)       │  - emergency_stop 서비스     │
+    │ /e6/camera/zed_image (20Hz)       └──────────────┬───────────────┘
+    │ /e6/robot/state      (20Hz)                       │
+    │ /e6/task/prompt      (이벤트)                     │ /e6/supervisor/status
     │                                                  │ (RUNNING / STAGE_DONE / FAIL_*)
     │         ┌────────────────────────┐               │
     │         │   camera_state_node    │               ▼
     │         │  - HIKRobot 224x224    │   ┌────────────────────────────┐
-    │         │  - Dobot feedBack      │   │         task_node          │
-    │         │  - 20Hz 타이머         │   │  - task_sequence 상태머신  │
-    │         └──────────┬─────────────┘   │  - STAGE_DONE 받으면       │
-    │                    │                 │    다음 stage로 전환        │
-    │ /e6/camera/image   │                 │  - /e6/task/prompt 발행    │
-    │ /e6/robot/state    │                 └────────────────────────────┘
+    │         │  - ZED 224x224 (left)  │   │         task_node          │
+    │         │  - Dobot feedBack      │   │  - task_sequence 상태머신  │
+    │         │  - 20Hz 타이머         │   │  - STAGE_DONE 받으면       │
+    │         └──────────┬─────────────┘   │    다음 stage로 전환        │
+    │                    │                 │  - /e6/task/prompt 발행    │
+    │ /e6/camera/image   │                 └────────────────────────────┘
+    │ /e6/camera/zed_image│
+    │ /e6/robot/state    │
     │ /e6/robot/tcp_z    │
     └────────────────────┘
 
@@ -51,7 +53,8 @@
         ▼
 [camera_state_node]
         │
-        ├── /e6/camera/image
+        ├── /e6/camera/image       (HIK)
+        ├── /e6/camera/zed_image   (ZED left)
         ├── /e6/robot/state
         └── /e6/robot/tcp_z
                 │
@@ -94,9 +97,10 @@
 
 ```
 t=0ms      camera_state_node 20Hz 타이머
-           → /e6/camera/image 발행
-           → /e6/robot/state  발행
-           → /e6/robot/tcp_z  발행
+           → /e6/camera/image     발행  (HIK)
+           → /e6/camera/zed_image 발행  (ZED left)
+           → /e6/robot/state      발행
+           → /e6/robot/tcp_z      발행
 
 t=0ms      inference_bridge_node obs 캐시 업데이트
            → inference_running=False 이면 추론 스레드 시작
@@ -121,6 +125,7 @@ t=2400ms                          → chunk[15] → MovJ (16/20Hz = 0.8초)
 | 토픽 | 타입 | 발행 노드 | Hz |
 |------|------|----------|----|
 | `/e6/camera/image` | `sensor_msgs/Image` | camera_state_node | 20 |
+| `/e6/camera/zed_image` | `sensor_msgs/Image` | camera_state_node | 20 |
 | `/e6/robot/state` | `std_msgs/Float32MultiArray` | camera_state_node | 20 |
 | `/e6/robot/tcp_z` | `std_msgs/Float32` | camera_state_node | 20 |
 | `/e6/task/prompt` | `std_msgs/String` | task_node | 이벤트 |

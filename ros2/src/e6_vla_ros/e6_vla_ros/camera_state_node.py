@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-camera_state_node — HIKRobot 카메라 + Dobot feedBack 읽기
+camera_state_node — HIKRobot 카메라 + ZED 카메라 + Dobot feedBack 읽기
 
 발행 토픽:
-  /e6/camera/image        sensor_msgs/Image          20Hz  224x224 RGB
+  /e6/camera/image        sensor_msgs/Image          20Hz  224x224 RGB  (HIK)
+  /e6/camera/zed_image    sensor_msgs/Image          20Hz  224x224 RGB  (ZED left)
   /e6/robot/state         std_msgs/Float32MultiArray 20Hz  [j1..j6 deg, gripper 0~1]
   /e6/robot/tcp_z         std_msgs/Float32           20Hz  TCP Z (mm)
 
@@ -62,19 +63,23 @@ class CameraStateNode(Node):
         self._camera_black_mean = self.get_parameter("camera_black_mean").value
 
         # 퍼블리셔
-        self._img_pub   = self.create_publisher(Image,              "/e6/camera/image",  10)
-        self._state_pub = self.create_publisher(Float32MultiArray,  "/e6/robot/state",   10)
-        self._tcpz_pub  = self.create_publisher(Float32,            "/e6/robot/tcp_z",   10)
+        self._img_pub     = self.create_publisher(Image,             "/e6/camera/image",     10)
+        self._zed_pub     = self.create_publisher(Image,             "/e6/camera/zed_image", 10)
+        self._state_pub   = self.create_publisher(Float32MultiArray, "/e6/robot/state",      10)
+        self._tcpz_pub    = self.create_publisher(Float32,           "/e6/robot/tcp_z",      10)
 
         # 하드웨어 초기화
         self._feed = None
         self._camera = None
+        self._zed = None
+        self._zed_mat = None
         self._last_gripper = 0.0
 
         if not self._dry_run:
             self._init_robot(robot_ip)
         if not self._no_camera:
             self._init_camera()
+            self._init_zed()
 
         # 20Hz 타이머
         self.create_timer(0.05, self._tick)
@@ -98,21 +103,48 @@ class CameraStateNode(Node):
         try:
             import camera_capture  # type: ignore
             self._camera = camera_capture.CameraCapture()
-            self.get_logger().info(f"카메라 초기화: {self._camera._name}")
+            self.get_logger().info(f"HIK 카메라 초기화: {self._camera._name}")
         except Exception as exc:
-            self.get_logger().warn(f"카메라 초기화 실패 ({exc}) → 더미 이미지")
+            self.get_logger().warn(f"HIK 카메라 초기화 실패 ({exc}) → 더미 이미지")
             self._camera = None
+
+    def _init_zed(self):
+        try:
+            import pyzed.sl as sl  # type: ignore
+            zed = sl.Camera()
+            init_params = sl.InitParameters()
+            init_params.depth_mode = sl.DEPTH_MODE.NONE
+            init_params.camera_resolution = sl.RESOLUTION.HD720
+            status = zed.open(init_params)
+            if status != sl.ERROR_CODE.SUCCESS:
+                self.get_logger().warn(f"ZED 카메라 오픈 실패: {status} → 더미 이미지")
+                return
+            self._zed = zed
+            self._zed_mat = sl.Mat()
+            self.get_logger().info(
+                f"ZED 카메라 초기화: SN={zed.get_camera_information().serial_number}"
+            )
+        except Exception as exc:
+            self.get_logger().warn(f"ZED 카메라 초기화 실패 ({exc}) → 더미 이미지")
+            self._zed = None
+            self._zed_mat = None
 
     # ── 20Hz 타이머 ─────────────────────────────────────────────────────────
 
     def _tick(self):
         now = self.get_clock().now().to_msg()
 
-        # 1) 이미지
+        # 1) HIK 이미지
         frame = self._read_frame()
         img_msg = _numpy_to_image_msg(frame)
         img_msg.header.stamp = now
         self._img_pub.publish(img_msg)
+
+        # 2) ZED 이미지
+        zed_frame = self._read_zed_frame()
+        zed_msg = _numpy_to_image_msg(zed_frame)
+        zed_msg.header.stamp = now
+        self._zed_pub.publish(zed_msg)
 
         # 2) 로봇 상태
         deg6, tcp_z, gripper = self._read_robot_state()
@@ -134,7 +166,25 @@ class CameraStateNode(Node):
             if frame is not None:
                 return np.asarray(frame, dtype=np.uint8)
         except Exception as exc:
-            self.get_logger().warn(f"카메라 읽기 실패: {exc}", throttle_duration_sec=5.0)
+            self.get_logger().warn(f"HIK 카메라 읽기 실패: {exc}", throttle_duration_sec=5.0)
+        return np.zeros((H, W, 3), dtype=np.uint8)
+
+    def _read_zed_frame(self) -> np.ndarray:
+        H = W = 224
+        if self._zed is None or self._zed_mat is None:
+            return np.zeros((H, W, 3), dtype=np.uint8)
+        try:
+            import pyzed.sl as sl  # type: ignore
+            if self._zed.grab() == sl.ERROR_CODE.SUCCESS:
+                self._zed.retrieve_image(self._zed_mat, sl.VIEW.LEFT)
+                frame = self._zed_mat.get_data()[:, :, :3]  # BGRA → BGR drop alpha
+                frame = frame[:, :, ::-1].copy()            # BGR → RGB
+                # 224x224으로 리사이즈
+                import cv2  # type: ignore
+                frame = cv2.resize(frame, (W, H))
+                return frame.astype(np.uint8)
+        except Exception as exc:
+            self.get_logger().warn(f"ZED 카메라 읽기 실패: {exc}", throttle_duration_sec=5.0)
         return np.zeros((H, W, 3), dtype=np.uint8)
 
     # ── 로봇 상태 읽기 ──────────────────────────────────────────────────────

@@ -152,6 +152,7 @@ def main() -> None:
     parser.add_argument("--robot_ip", default="192.168.5.1", help="Dobot E6 IP")
     parser.add_argument("--dry_run", action="store_true", help="로봇 전송 없이 추론만")
     parser.add_argument("--no_camera", action="store_true", help="카메라 미사용 (더미 이미지)")
+    parser.add_argument("--show_actions", action="store_true", help="매 스텝 예측 액션값 출력 (관절 delta + 그리퍼)")
 
     # ── 프롬프트 ─────────────────────────────────────────────────────────────
     parser.add_argument("--prompt", default="approach red object", help="작업 지시 문구")
@@ -530,6 +531,15 @@ def main() -> None:
                 actions = np.asarray(result["actions"])
                 if step == 0:
                     print(f"  [ACTION_SHAPE] {actions.shape}")
+                if args.show_actions:
+                    a0 = actions[0]
+                    joints = a0[:6]
+                    gripper = float(a0[7]) if actions.shape[1] > 7 else float(a0[6])
+                    print(
+                        f"  [ACTION] step={step:4d} | "
+                        f"j=[{', '.join(f'{v:+.3f}' for v in joints)}] | "
+                        f"gripper={gripper:.3f}"
+                    )
 
                 spi = steps_per_inference if steps_per_inference is not None else actions.shape[0]
                 current_chunk = actions[:spi]

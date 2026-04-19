@@ -474,6 +474,7 @@ class LeRobotE6DataConfig(DataConfigFactory):
                 _transforms.RepackTransform(
                     {
                         "observation/exterior_image_1_left": "exterior_image_1_left",
+                        "observation/exterior_image_2_left": "exterior_image_2_left",
                         "observation/state": "state",
                         # Map LeRobot ``action`` -> openpi ``actions`` for downstream transforms.
                         "actions": "action",

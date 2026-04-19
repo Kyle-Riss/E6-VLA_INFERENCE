@@ -3,12 +3,13 @@
 inference_bridge_node — obs 조립 → WebSocket 추론 → action_chunk 발행
 
 구독 토픽:
-  /e6/camera/image        sensor_msgs/Image
-  /e6/robot/state         std_msgs/Float32MultiArray  [j1..j6 deg, gripper]
+  /e6/camera/image        sensor_msgs/Image                HIK 카메라 (exterior_image_1_left)
+  /e6/camera/zed_image    sensor_msgs/Image                ZED 카메라 (exterior_image_2_left)
+  /e6/robot/state         std_msgs/Float32MultiArray       [j1..j6 deg, gripper]
   /e6/task/prompt         std_msgs/String
 
 발행 토픽:
-  /e6/policy/action_chunk std_msgs/Float32MultiArray  (16*7 flatten)
+  /e6/policy/action_chunk std_msgs/Float32MultiArray       (16*7 flatten)
 
 파라미터:
   server_host  (str,   default "127.0.0.1")
@@ -57,7 +58,8 @@ class InferenceBridgeNode(Node):
         infer_hz = self.get_parameter("infer_hz").value
 
         # 최신 obs 캐시 (항상 가장 최근 값 유지)
-        self._latest_img: np.ndarray | None = None
+        self._latest_img: np.ndarray | None = None      # HIK
+        self._latest_zed: np.ndarray | None = None      # ZED
         self._latest_state: np.ndarray | None = None
         self._latest_prompt: str = "approach red object"
         self._lock = threading.Lock()
@@ -67,8 +69,9 @@ class InferenceBridgeNode(Node):
         self._executor = ThreadPoolExecutor(max_workers=1)
 
         # 구독
-        self.create_subscription(Image,             "/e6/camera/image",  self._cb_img,    10)
-        self.create_subscription(Float32MultiArray, "/e6/robot/state",   self._cb_state,  10)
+        self.create_subscription(Image,             "/e6/camera/image",     self._cb_img,     10)
+        self.create_subscription(Image,             "/e6/camera/zed_image", self._cb_zed,     10)
+        self.create_subscription(Float32MultiArray, "/e6/robot/state",      self._cb_state,   10)
 
         qos_transient = QoSProfile(
             durability=DurabilityPolicy.TRANSIENT_LOCAL, depth=1
@@ -128,6 +131,10 @@ class InferenceBridgeNode(Node):
         with self._lock:
             self._latest_img = _image_msg_to_numpy(msg)
 
+    def _cb_zed(self, msg: Image):
+        with self._lock:
+            self._latest_zed = _image_msg_to_numpy(msg)
+
     def _cb_state(self, msg: Float32MultiArray):
         with self._lock:
             self._latest_state = np.array(msg.data, dtype=np.float32)
@@ -147,15 +154,20 @@ class InferenceBridgeNode(Node):
 
         with self._lock:
             img = self._latest_img
+            zed = self._latest_zed
             state = self._latest_state
             prompt = self._latest_prompt
 
         if img is None or state is None:
             return  # obs 아직 없음
 
+        # ZED 없으면 zeros로 대체 (카메라 미연결 시 graceful degradation)
+        zed_frame = zed.copy() if zed is not None else np.zeros((224, 224, 3), dtype=np.uint8)
+
         # obs 스냅샷 (추론 중 덮어써도 안전하게 복사)
         obs = {
             "observation/exterior_image_1_left": img.copy(),
+            "observation/exterior_image_2_left": zed_frame,
             "observation/state":                 state.copy(),
             "prompt":                            prompt,
         }

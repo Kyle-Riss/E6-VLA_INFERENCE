@@ -150,6 +150,7 @@ python ~/e6-vla/examples/e6/run_e6_client.py \
 | `--z_grip_trigger` | None | TCP Z(mm) 이하 + grip>0 이면 강제 닫힘 (예: 170) |
 | `--dry_run` | False | 로봇 전송 없이 추론만 |
 | `--no_camera` | False | 카메라 미사용 (더미 이미지) |
+| `--show_actions` | False | 매 스텝 예측 액션값 출력 (관절 delta + 그리퍼) |
 | `--no_init_pose` | False | 초기 자세 이동 스킵 |
 | `--max_runtime_sec` | None | 최대 실행 시간(초) |
 | `--save_frames_dir` | None | 프레임 저장 디렉터리 |
@@ -192,10 +193,9 @@ python ~/e6-vla/examples/e6/run_e6_client.py \
 
 | 키 | shape | dtype | 설명 |
 |----|-------|-------|------|
-| `observation/exterior_image_1_left` | (224, 224, 3) | uint8 | 탑뷰 카메라 RGB |
-| `observation/wrist_image_left` | (224, 224, 3) | uint8 | 손목 카메라 (ur5_style=zeros) |
-| `observation/joint_position` | (7,) | float32 | [j1..j6, 0] rad |
-| `observation/gripper_position` | (1,) | float32 | 0=open, 1=closed |
+| `observation/exterior_image_1_left` | (224, 224, 3) | uint8 | HIKRobot 탑뷰 RGB |
+| `observation/exterior_image_2_left` | (224, 224, 3) | uint8 | ZED X left eye RGB |
+| `observation/state` | (7,) | float32 | [j1..j6 deg, gripper 0~1] |
 | `prompt` | str | — | 작업 지시 문구 |
 
 ---

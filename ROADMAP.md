@@ -23,12 +23,19 @@
 - `pi05_e6_v1_lora` config (E6Inputs, 7D degree, action_horizon=16)
 
 ### ✅ ROS2 4노드 구현 (feature/ros2-integration)
-- **camera_state_node** — HIKRobot + Dobot feedBack 20Hz 발행
-- **inference_bridge_node** — obs 조립 + WebSocket 비블로킹 추론
+- **camera_state_node** — HIKRobot + ZED X (2채널) + Dobot feedBack 20Hz 발행
+- **inference_bridge_node** — obs 조립 (HIK + ZED) + WebSocket 비블로킹 추론
 - **executor_supervisor_node** — MovJ/ToolDO 실행 + 안전 감시
 - **task_node** — task_sequence 상태머신 + prompt 관리
 - `dry_run + no_camera` 테스트 통과
 - `serve_policy.py` WebSocket 연동 및 추론 (16×7) 확인
+
+### ✅ 2채널 카메라 (ZED X) 통합
+- `e6_policy.py` E6Inputs — HIK + ZED 2채널 처리 (`image_mask` 둘 다 True)
+- `config.py` LeRobotE6DataConfig — `exterior_image_2_left` 매핑 추가
+- `camera_state_node` — `/e6/camera/zed_image` 토픽 추가
+- `inference_bridge_node` — ZED obs 포함 (`exterior_image_2_left`)
+- 체크포인트: `e6_2cam_lora_v1_pytorch/31999_pytorch` (PyTorch safetensors)
 
 ---
 
@@ -38,10 +45,11 @@
 
 #### 1. 카메라 연결 테스트
 ```bash
-# HIKRobot 연결 후
+# HIKRobot + ZED 연결 후
 ros2 launch e6_vla_ros e6_vla.launch.py dry_run:=true task_sequence:="approach"
-# → /e6/camera/image 정상 발행 확인
-ros2 topic hz /e6/camera/image   # 20Hz 나와야 함
+# → 두 카메라 토픽 정상 발행 확인
+ros2 topic hz /e6/camera/image       # 20Hz 나와야 함
+ros2 topic hz /e6/camera/zed_image   # 20Hz 나와야 함
 ```
 
 #### 2. 로봇 연결 테스트
@@ -140,8 +148,8 @@ e6-vla/
 ├── ros2/
 │   └── src/e6_vla_ros/
 │       ├── e6_vla_ros/
-│       │   ├── camera_state_node.py       # HIKRobot + feedBack 20Hz
-│       │   ├── inference_bridge_node.py   # obs 조립 + WebSocket 추론
+│       │   ├── camera_state_node.py       # HIKRobot + ZED X + feedBack 20Hz
+│       │   ├── inference_bridge_node.py   # obs 조립 (2채널) + WebSocket 추론
 │       │   ├── executor_supervisor_node.py# MovJ/ToolDO + 안전 감시
 │       │   ├── task_node.py               # task_sequence 상태머신
 │       │   └── web_bridge_node.py         # (P2) FastAPI 브리지 — 미구현
@@ -164,7 +172,7 @@ e6-vla/
 
 | 항목 | 값 |
 |------|-----|
-| 체크포인트 | `~/checkpoints/pi05_e6_v1_lora/e6_primitive_v1_bs8_nowb_20260408_1607/pytorch_from_jax` |
+| 체크포인트 | `~/checkpoints/pi05_e6_v1_lora/e6_2cam_lora_v1_pytorch/31999_pytorch` |
 | 가상환경 | `~/move-one/min-imum/move-one/bin/activate` |
 | 로봇 IP | `192.168.5.1` |
 | 정책 서버 포트 | `8000` |
