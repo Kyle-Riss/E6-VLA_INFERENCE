@@ -40,7 +40,7 @@ ping -c 2 192.168.5.1
 
 ```bash
 # 실행 전 SDK 경로 설정 (카메라 사용 시)
-export MVCAM_COMMON_RUNENV=/opt/MVS/lib64
+export MVCAM_COMMON_RUNENV=/opt/MVS/lib
 ```
 
 ---
@@ -51,7 +51,7 @@ export MVCAM_COMMON_RUNENV=/opt/MVS/lib64
 
 ```bash
 source ~/move-one/min-imum/move-one/bin/activate
-export MVCAM_COMMON_RUNENV=/opt/MVS/lib64
+export MVCAM_COMMON_RUNENV=/opt/MVS/lib
 
 PYTHONPATH=~/e6-vla/src \
 python ~/e6-vla/scripts/serve_policy.py \
@@ -91,7 +91,7 @@ python ~/e6-vla/scripts/serve_dummy.py \
 
 ```bash
 source ~/move-one/min-imum/move-one/bin/activate
-export MVCAM_COMMON_RUNENV=/opt/MVS/lib64
+export MVCAM_COMMON_RUNENV=/opt/MVS/lib
 
 python ~/e6-vla/examples/e6/run_e6_client.py \
   --server_host 127.0.0.1 \
@@ -219,7 +219,7 @@ python ~/e6-vla/examples/e6/run_e6_client.py \
 | `Connection refused` | 서버 미실행 | serve_policy.py 또는 serve_dummy.py 먼저 실행 |
 | `ModuleNotFoundError: etils` | 가상환경 미사용 | `source ~/move-one/min-imum/move-one/bin/activate` |
 | `Dobot 소켓 연결 실패` | eno1 IP 없음 또는 케이블 미연결 | `ping 192.168.5.1`, nmcli 설정 확인 |
-| 카메라 `ImportError: MvCameraControl` | MVS SDK 경로 없음 | `export MVCAM_COMMON_RUNENV=/opt/MVS/lib64` |
+| 카메라 `ImportError: MvCameraControl` | MVS SDK 경로 없음 | `export MVCAM_COMMON_RUNENV=/opt/MVS/lib` |
 | `norm_stats.json not found` | 체크포인트 폴더 구조 불완전 | `assets/droid/norm_stats.json` 존재 여부 확인 |
 | 로봇이 거의 안 움직임 | action_scale 작음 | `--action_scale 2.0` 또는 `--action_scale 3.0` 시도 |
 | 그리퍼가 안 닫힘 | grip 출력 낮음 | `--grip_close_threshold 0.05 --z_grip_trigger 170` |

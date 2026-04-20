@@ -104,6 +104,7 @@ e6-vla/
 - `/e6/policy/action_chunk` 수신 시 청크 갱신
 - 18Hz 타이머 → `chunk[index]` 꺼내서 MovJ / ToolDO 실행
 - `max_delta_deg` 클리핑, staleness 체크
+- `steps_per_inference` (기본 8) — 청크에서 몇 스텝 실행 후 재추론할지 지정 (0=전체 청크)
 
 ### supervisor_node
 - bad_camera (frame_mean 임계값)
@@ -129,7 +130,8 @@ source install/setup.bash
 # 4. 전체 런치
 ros2 launch e6_vla_ros e6_vla.launch.py \
   checkpoint:=... \
-  task_sequence:="approach,pick,move_left,place_left"
+  task_sequence:="approach,pick,move_left,place_left" \
+  steps_per_inference:=8
 
 # 또는 단일 노드 개별 실행
 ros2 run e6_vla_ros camera_node

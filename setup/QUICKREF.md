@@ -48,7 +48,7 @@ python ~/e6-vla/examples/e6/run_e6_client.py \
 ### 카메라만 테스트
 ```bash
 # HIKRobot MVS SDK 경로 설정 필요
-export MVCAM_COMMON_RUNENV=/opt/MVS/lib64
+export MVCAM_COMMON_RUNENV=/opt/MVS/lib
 python ~/e6-vla/hardware/utils/test_robot_connection.py
 ```
 

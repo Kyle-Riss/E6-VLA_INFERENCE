@@ -48,7 +48,7 @@ Dobot E6 로봇 팔을 위한 π0.5 VLA(Vision-Language-Action) 추론 파이프
 
 ```bash
 source ~/move-one/min-imum/move-one/bin/activate
-export MVCAM_COMMON_RUNENV=/opt/MVS/lib64
+export MVCAM_COMMON_RUNENV=/opt/MVS/lib
 ```
 
 ### 2. 정책 서버 실행 (터미널 1)
