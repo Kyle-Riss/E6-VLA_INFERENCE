@@ -27,6 +27,10 @@ executor_supervisor_node — 액션 실행 + 안전 감시
   movj_accel            (int,   default 60)
   chunk_staleness_sec   (float, default 5.0)
   steps_per_inference   (int,   default 8)    — 청크에서 실행할 스텝 수 (0=전체)
+  executor_hz           (float, default 18.0) — MovJ 전송 주파수 (낮출수록 느려짐)
+  approach_z_done       (float, default 85.0) — approach 완료: TCP Z ≤ 이 값 (mm)
+  lift_z_done           (float, default 200.0)— pick/place 완료: TCP Z ≥ 이 값 (mm)
+  stage_done_steps      (int,   default 3)    — 완료 조건 연속 만족 스텝 수
   bad_camera_consecutive(int,   default 10)
   camera_black_mean     (float, default 8.0)
 """
@@ -74,6 +78,10 @@ class ExecutorSupervisorNode(Node):
         self.declare_parameter("movj_accel", 60)
         self.declare_parameter("chunk_staleness_sec", 5.0)
         self.declare_parameter("steps_per_inference", 8)
+        self.declare_parameter("executor_hz", 18.0)
+        self.declare_parameter("approach_z_done", 85.0)
+        self.declare_parameter("lift_z_done", 200.0)
+        self.declare_parameter("stage_done_steps", 3)
         self.declare_parameter("bad_camera_consecutive", 10)
         self.declare_parameter("camera_black_mean", 8.0)
 
@@ -89,6 +97,10 @@ class ExecutorSupervisorNode(Node):
         self._staleness_sec = self.get_parameter("chunk_staleness_sec").value
         _spi = self.get_parameter("steps_per_inference").value
         self._steps_per_inference = _spi if _spi > 0 else ACTION_HORIZON
+        _executor_hz = self.get_parameter("executor_hz").value
+        self._approach_z_done = self.get_parameter("approach_z_done").value
+        self._lift_z_done = self.get_parameter("lift_z_done").value
+        self._stage_done_steps = self.get_parameter("stage_done_steps").value
         self._bad_cam_limit = self.get_parameter("bad_camera_consecutive").value
         self._black_mean = self.get_parameter("camera_black_mean").value
 
@@ -109,11 +121,21 @@ class ExecutorSupervisorNode(Node):
         self._emergency_stop = False
         self._status = "RUNNING"
 
+        # stage 완료 감지
+        self._current_stage = "approach"   # 현재 stage (prompt로 갱신)
+        self._done_streak = 0              # 완료 조건 연속 만족 카운트
+        self._stage_done_published = False # 같은 stage에서 중복 발행 방지
+
+        # task 완료 플래그
+        self._task_complete = False
+
         # 구독
-        self.create_subscription(Float32MultiArray, "/e6/policy/action_chunk", self._cb_chunk,  10)
-        self.create_subscription(Image,             "/e6/camera/image",         self._cb_img,    10)
-        self.create_subscription(Float32MultiArray, "/e6/robot/state",          self._cb_state,  10)
-        self.create_subscription(Float32,           "/e6/robot/tcp_z",          self._cb_tcpz,   10)
+        self.create_subscription(Float32MultiArray, "/e6/policy/action_chunk", self._cb_chunk,       10)
+        self.create_subscription(Image,             "/e6/camera/image",         self._cb_img,         10)
+        self.create_subscription(Float32MultiArray, "/e6/robot/state",          self._cb_state,       10)
+        self.create_subscription(Float32,           "/e6/robot/tcp_z",          self._cb_tcpz,        10)
+        self.create_subscription(String,            "/e6/task/prompt",          self._cb_prompt,      10)
+        self.create_subscription(String,            "/e6/task/status",          self._cb_task_status, 10)
 
         # 발행
         self._status_pub = self.create_publisher(String, "/e6/supervisor/status", 10)
@@ -127,18 +149,21 @@ class ExecutorSupervisorNode(Node):
         if not self._dry_run:
             self._init_robot(robot_ip)
 
-        # 타이머 (학습 데이터 수집 주파수 18Hz에 맞춤)
-        self.create_timer(1/18,  self._executor_tick)   # 18Hz
+        # 타이머
+        self.create_timer(1.0 / _executor_hz, self._executor_tick)
         self.create_timer(0.10,  self._supervisor_tick) # 10Hz
 
         self.get_logger().info(
             f"executor_supervisor_node 시작 — "
             f"robot={'연결됨' if self._dashboard else 'dry_run'} "
-            f"max_delta={self._max_delta}° min_tool_z={self._min_tool_z}mm "
-            f"steps_per_inference={self._steps_per_inference}/{ACTION_HORIZON}"
+            f"executor_hz={_executor_hz} max_delta={self._max_delta}° "
+            f"min_tool_z={self._min_tool_z}mm steps_per_inference={self._steps_per_inference}/{ACTION_HORIZON}"
         )
 
     # ── 초기화 ──────────────────────────────────────────────────────────────
+
+    # e6_v1 학습 데이터 기준 초기 자세 (degree)
+    INIT_POSE_DEG = [90.128, 42.907, 59.355, -11.702, -87.582, 177.813]
 
     def _init_robot(self, robot_ip: str):
         try:
@@ -146,6 +171,10 @@ class ExecutorSupervisorNode(Node):
             self._dashboard = DobotApiDashboard(robot_ip, 29999)
             self._dashboard.EnableRobot()
             time.sleep(0.5)
+            j1, j2, j3, j4, j5, j6 = self.INIT_POSE_DEG
+            self._dashboard.MovJ(j1, j2, j3, j4, j5, j6, 1, v=50, a=40)
+            self.get_logger().info(f"초기 자세 이동 중: {self.INIT_POSE_DEG}")
+            time.sleep(3.0)
             self.get_logger().info(f"Dobot dashboard 연결: {robot_ip}:29999")
         except Exception as exc:
             self.get_logger().warn(f"Dobot 연결 실패 ({exc}) → dry_run 모드")
@@ -175,10 +204,37 @@ class ExecutorSupervisorNode(Node):
     def _cb_tcpz(self, msg: Float32):
         self._tcp_z = msg.data
 
+    def _cb_task_status(self, msg: String):
+        if msg.data == "TASK_COMPLETE" and not self._task_complete:
+            self._task_complete = True
+            self.get_logger().info("TASK_COMPLETE 수신 → 모션 정지")
+            with self._chunk_lock:
+                self._chunk = None
+                self._chunk_idx = 0
+
+    def _cb_prompt(self, msg: String):
+        prompt = msg.data
+        # prompt → stage 이름 추출
+        if "approach" in prompt:
+            stage = "approach"
+        elif "pick" in prompt:
+            stage = "pick"
+        elif "move" in prompt:
+            stage = "move"
+        elif "place" in prompt:
+            stage = "place"
+        else:
+            stage = prompt
+        if stage != self._current_stage:
+            self.get_logger().info(f"stage 변경: {self._current_stage} → {stage}")
+            self._current_stage = stage
+            self._done_streak = 0
+            self._stage_done_published = False
+
     # ── 20Hz 실행 루프 ───────────────────────────────────────────────────────
 
     def _executor_tick(self):
-        if self._emergency_stop:
+        if self._emergency_stop or self._task_complete:
             return
 
         with self._chunk_lock:
@@ -201,18 +257,8 @@ class ExecutorSupervisorNode(Node):
 
         a = chunk[idx]  # (7,)
 
-        # delta_deg 계산 (e6_v1: 이미 degree)
-        delta_deg = np.clip(
-            np.asarray(a[:6], dtype=np.float32),
-            -self._max_delta, self._max_delta
-        )
-
-        # bad camera → 모션 홀드
-        if hasattr(self, "_frame_mean") and self._frame_mean < self._black_mean:
-            delta_deg[:] = 0.0
-
-        # 목표 관절각 (action = 절대 next-position, delta 가산 아님)
-        target_deg = delta_deg
+        # 절대 목표 관절각 (e6_v1: action = 절대 degree next-position)
+        target_deg = np.asarray(a[:6], dtype=np.float32)
 
         # 그리퍼 hysteresis
         grip_raw = float(a[6]) if len(a) > 6 else 0.0
@@ -232,12 +278,16 @@ class ExecutorSupervisorNode(Node):
 
         tool_on = int(hys)
 
+        # bad camera → MovJ 스킵 (현재 위치 유지)
+        camera_hold = hasattr(self, "_frame_mean") and self._frame_mean < self._black_mean
+
         # 로봇 명령 전송
         if self._dashboard is not None:
             try:
-                j1, j2, j3, j4, j5, j6 = (float(x) for x in target_deg)
-                self._dashboard.MovJ(j1, j2, j3, j4, j5, j6, 1,
-                                     v=self._movj_v, a=self._movj_a)
+                if not camera_hold:
+                    j1, j2, j3, j4, j5, j6 = (float(x) for x in target_deg)
+                    self._dashboard.MovJ(j1, j2, j3, j4, j5, j6, 1,
+                                         v=self._movj_v, a=self._movj_a)
                 self._dashboard.ToolDO(1, tool_on)
             except Exception as exc:
                 self.get_logger().warn(f"MovJ 실패: {exc}", throttle_duration_sec=2.0)
@@ -266,13 +316,39 @@ class ExecutorSupervisorNode(Node):
             else:
                 self._bad_streak = 0
 
-        # min_tool_z 안전 한계 (dry_run이거나 실제 로봇 연결 전이면 스킵)
+        # min_tool_z 안전 한계
         if (not self._dry_run
                 and self._dashboard is not None
                 and self._tcp_z is not None
                 and self._tcp_z <= self._min_tool_z):
             status = f"FAIL_SAFETY:min_tool_z({self._tcp_z:.1f}mm)"
             self.get_logger().warn(f"Tool Z={self._tcp_z:.1f}mm ≤ {self._min_tool_z:.1f}mm")
+
+        # STAGE_DONE 판정 (FAIL이 없을 때만)
+        if status == "RUNNING" and not self._stage_done_published and self._tcp_z is not None:
+            done = False
+            stage = self._current_stage
+            z = self._tcp_z
+            g = self._last_gripper
+
+            if stage == "approach":
+                done = z <= self._approach_z_done
+            elif stage == "pick":
+                done = z >= self._lift_z_done and g == 1
+            elif stage == "place":
+                done = z >= self._lift_z_done and g == 0
+            # move: timeout에 맡김 (센서 조건 없음)
+
+            if done:
+                self._done_streak += 1
+                if self._done_streak >= self._stage_done_steps:
+                    status = f"STAGE_DONE:{stage}"
+                    self._stage_done_published = True
+                    self.get_logger().info(
+                        f"[STAGE_DONE] {stage} | TCP_Z={z:.1f}mm gripper={g}"
+                    )
+            else:
+                self._done_streak = 0
 
         self._status = status
         self._status_pub.publish(String(data=status))

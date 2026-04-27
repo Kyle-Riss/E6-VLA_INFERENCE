@@ -58,7 +58,8 @@ class TaskNode(Node):
 
         # transient_local: 나중에 구독해도 최신값 받음
         qos = QoSProfile(durability=DurabilityPolicy.TRANSIENT_LOCAL, depth=1)
-        self._prompt_pub = self.create_publisher(String, "/e6/task/prompt", qos)
+        self._prompt_pub  = self.create_publisher(String, "/e6/task/prompt",  qos)
+        self._status_pub  = self.create_publisher(String, "/e6/task/status",  10)
 
         # supervisor status 구독
         self.create_subscription(String, "/e6/supervisor/status", self._cb_status, 10)
@@ -86,6 +87,7 @@ class TaskNode(Node):
 
         elif status.startswith("FAIL_SAFETY"):
             self.get_logger().error(f"안전 이상 감지 — task 중단: {status}")
+            self._status_pub.publish(String(data=status))
             self._done = True
 
     # ── timeout 체크 타이머 ───────────────────────────────────────────────────
@@ -109,7 +111,10 @@ class TaskNode(Node):
                 self._idx = 0
                 self.get_logger().info("전체 sequence 완료 → 처음으로 루프")
             else:
-                self.get_logger().info("전체 task_sequence 완료")
+                self.get_logger().info("=" * 60)
+                self.get_logger().info("TASK_COMPLETE: 모든 stage 완료! 모션 정지")
+                self.get_logger().info("=" * 60)
+                self._status_pub.publish(String(data="TASK_COMPLETE"))
                 self._done = True
                 return
         self._stage_start = self.get_clock().now()

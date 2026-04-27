@@ -247,7 +247,11 @@ class CameraCapture:
                     else:
                         img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
 
-            img = cv2.resize(img, (IMG_W, IMG_H), interpolation=cv2.INTER_LINEAR)
+            # 학습 수집(robot_server.py)과 동일한 전처리
+            # Native → 640×480 → 320×240 → crop[16:240, 55:279] → 224×224
+            img = cv2.resize(img, (640, 480), interpolation=cv2.INTER_LINEAR)
+            img = cv2.resize(img, (320, 240), interpolation=cv2.INTER_LINEAR)
+            img = img[16:240, 55:279]
             img = np.asarray(img, dtype=np.uint8)
             self._last_frame = img
             return img

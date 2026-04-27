@@ -114,7 +114,8 @@ class CameraStateNode(Node):
             zed = sl.Camera()
             init_params = sl.InitParameters()
             init_params.depth_mode = sl.DEPTH_MODE.NONE
-            init_params.camera_resolution = sl.RESOLUTION.HD720
+            init_params.camera_resolution = sl.RESOLUTION.HD1080  # 학습 수집과 동일 해상도
+            init_params.camera_fps = 30
             status = zed.open(init_params)
             if status != sl.ERROR_CODE.SUCCESS:
                 self.get_logger().warn(f"ZED 카메라 오픈 실패: {status} → 더미 이미지")
@@ -174,13 +175,16 @@ class CameraStateNode(Node):
         if self._zed is None or self._zed_mat is None:
             return np.zeros((H, W, 3), dtype=np.uint8)
         try:
+            import cv2  # type: ignore
             import pyzed.sl as sl  # type: ignore
             if self._zed.grab() == sl.ERROR_CODE.SUCCESS:
                 self._zed.retrieve_image(self._zed_mat, sl.VIEW.LEFT)
-                frame = self._zed_mat.get_data()[:, :, :3]  # BGRA → BGR drop alpha
+                frame = self._zed_mat.get_data()[:, :, :3]  # BGRA → drop alpha
                 frame = frame[:, :, ::-1].copy()            # BGR → RGB
-                # 224x224으로 리사이즈
-                import cv2  # type: ignore
+                # 학습 수집(robot_server.py)과 동일한 전처리
+                # HD1080 → 640×480 → crop[120:480, 150:510] (360×360) → 224×224
+                frame = cv2.resize(frame, (640, 480))
+                frame = frame[120:480, 150:510]
                 frame = cv2.resize(frame, (W, H))
                 return frame.astype(np.uint8)
         except Exception as exc:

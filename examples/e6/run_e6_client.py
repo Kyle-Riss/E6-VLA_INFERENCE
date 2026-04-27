@@ -82,6 +82,25 @@ except ImportError:
     _camera_capture_mod = None
 
 
+def _read_zed_frame(zed, zed_mat) -> "np.ndarray":
+    """ZED HD1080 → 640×480 → crop[120:480, 150:510] → 224×224 RGB (학습과 동일)."""
+    import cv2
+    import pyzed.sl as sl  # type: ignore
+    if zed is None or zed_mat is None:
+        return np.zeros((224, 224, 3), dtype=np.uint8)
+    try:
+        if zed.grab() == sl.ERROR_CODE.SUCCESS:
+            zed.retrieve_image(zed_mat, sl.VIEW.LEFT)
+            frame = zed_mat.get_data()[:, :, :3][:, :, ::-1].copy()  # BGRA→RGB
+            frame = cv2.resize(frame, (640, 480))
+            frame = frame[120:480, 150:510]
+            frame = cv2.resize(frame, (224, 224))
+            return frame.astype(np.uint8)
+    except Exception as exc:
+        print(f"  [ZED] 읽기 실패: {exc}")
+    return np.zeros((224, 224, 3), dtype=np.uint8)
+
+
 # ── 프롬프트 프리셋 (e6_v1_task_contract.py 공식 문자열) ────────────────────
 # V1_SEGMENTS = ("approach", "pick", "move", "place") 만 학습됨.
 # "return" / "init_hold" 는 학습 데이터 미포함 (OOD) → 추론 품질 보장 없음.
@@ -152,6 +171,7 @@ def main() -> None:
     parser.add_argument("--robot_ip", default="192.168.5.1", help="Dobot E6 IP")
     parser.add_argument("--dry_run", action="store_true", help="로봇 전송 없이 추론만")
     parser.add_argument("--no_camera", action="store_true", help="카메라 미사용 (더미 이미지)")
+    parser.add_argument("--no_zed", action="store_true", help="ZED 카메라 비활성화 (HIK만 사용)")
     parser.add_argument("--show_actions", action="store_true", help="매 스텝 예측 액션값 출력 (관절 delta + 그리퍼)")
 
     # ── 프롬프트 ─────────────────────────────────────────────────────────────
@@ -287,12 +307,31 @@ def main() -> None:
             dashboard = move = feed = None
 
     camera = None
+    zed = None
+    zed_mat = None
     if not args.no_camera:
         if _camera_capture_mod is not None:
             camera = _camera_capture_mod.CameraCapture()
-            print(f"[2/3] 카메라: {camera._name}")
+            print(f"[2/3] HIK 카메라: {camera._name}")
         else:
             print("[WARN] camera_capture 모듈 없음 → 더미 이미지")
+        if not args.no_zed:
+            try:
+                import pyzed.sl as sl  # type: ignore
+                _zed = sl.Camera()
+                _init = sl.InitParameters()
+                _init.depth_mode = sl.DEPTH_MODE.NONE
+                _init.camera_resolution = sl.RESOLUTION.HD1080
+                _init.camera_fps = 30
+                _st = _zed.open(_init)
+                if _st == sl.ERROR_CODE.SUCCESS:
+                    zed = _zed
+                    zed_mat = sl.Mat()
+                    print(f"[2/3] ZED 카메라: SN={_zed.get_camera_information().serial_number}")
+                else:
+                    print(f"[WARN] ZED 오픈 실패: {_st} → 더미")
+            except Exception as exc:
+                print(f"[WARN] ZED 초기화 실패 ({exc}) → 더미")
 
     # ── 2.5) 초기 자세 ───────────────────────────────────────────────────────
     if not args.no_init_pose and dashboard is not None:
@@ -496,8 +535,9 @@ def main() -> None:
 
                 if args.input_layout == "e6_v1":
                     # E6Inputs 계약 (pi05_e6_v1 / pi05_e6_v1_lora):
-                    #   observation/state : (7,) float32 — [j1..j6 deg, gripper 0~1]
-                    #   observation/exterior_image_1_left 만 사용 (wrist 슬롯은 서버 내부에서 zeros)
+                    #   observation/state                 : (7,) float32 — [j1..j6 deg, gripper 0~1]
+                    #   observation/exterior_image_1_left : HIK 224×224 RGB
+                    #   observation/exterior_image_2_left : ZED 224×224 RGB (없으면 zeros)
                     deg6 = np.zeros(6, dtype=np.float32)
                     if feed is not None:
                         try:
@@ -507,8 +547,10 @@ def main() -> None:
                         except Exception as exc:
                             print(f"  피드백 읽기 실패: {exc}")
                     state_7 = np.concatenate([deg6, [current_gripper]], dtype=np.float32)
+                    zed_frame = _read_zed_frame(zed, zed_mat) if not args.no_zed else np.zeros((224, 224, 3), dtype=np.uint8)
                     obs = {
                         "observation/exterior_image_1_left": obs_img,
+                        "observation/exterior_image_2_left": zed_frame,
                         "observation/state": state_7,
                         "prompt": args.prompt,
                     }
@@ -584,10 +626,20 @@ def main() -> None:
                 except Exception as exc:
                     print(f"  피드백 읽기 실패: {exc}")
 
-            # ── 관절 델타 계산 ───────────────────────────────────────────────
+            # ── 관절 목표 계산 ───────────────────────────────────────────────
             if args.input_layout == "e6_v1":
-                # E6Inputs: actions[:, 0:6] = Δ도(degree), 변환 불필요
-                delta_deg = np.asarray([float(a[i]) for i in range(6)], dtype=np.float32)
+                # E6Inputs: actions[:, 0:6] = 절대 관절각 (degree)
+                target_joints_deg = np.asarray([float(a[i]) for i in range(6)], dtype=np.float32)
+                if args.action_scale != 1.0:
+                    target_joints_deg *= args.action_scale
+                if camera_hold:
+                    target_joints_deg = current_joints_deg[:6].copy() if current_joints_deg is not None else target_joints_deg
+                # max_delta_deg: 현재 관절 대비 이동 거리 제한 (절댓값 클립이 아님)
+                if args.max_delta_deg > 0 and current_joints_deg is not None:
+                    diff = target_joints_deg - current_joints_deg[:6]
+                    diff = np.clip(diff, -args.max_delta_deg, args.max_delta_deg)
+                    target_joints_deg = current_joints_deg[:6] + diff
+                delta_deg = target_joints_deg  # 로그 출력용
             else:
                 # DroidInputs: actions[:, 0:6] = Δrad → deg 변환
                 delta_rad = np.asarray([float(a[i]) for i in range(6)], dtype=np.float32)
@@ -596,18 +648,11 @@ def main() -> None:
                 if camera_hold:
                     delta_rad[:] = 0.0
                 delta_deg = np.rad2deg(delta_rad)
-
-            if args.input_layout == "e6_v1":
-                if args.action_scale != 1.0:
-                    delta_deg *= args.action_scale
-                if camera_hold:
-                    delta_deg[:] = 0.0
-
-            if args.max_delta_deg > 0:
-                delta_deg = np.clip(delta_deg, -args.max_delta_deg, args.max_delta_deg)
+                if args.max_delta_deg > 0:
+                    delta_deg = np.clip(delta_deg, -args.max_delta_deg, args.max_delta_deg)
 
             # ── approach j3 assist (모델이 내려가지 않을 때 j3 바이어스 추가) ──────
-            if args.approach_j3_assist_deg != 0.0 and stage_name == "approach":
+            if args.approach_j3_assist_deg != 0.0 and stage_name == "approach" and args.input_layout != "e6_v1":
                 if loop_tool_z is None or loop_tool_z > args.approach_z_done:
                     delta_deg = delta_deg.copy()
                     delta_deg[2] += args.approach_j3_assist_deg
@@ -615,11 +660,12 @@ def main() -> None:
                         delta_deg = np.clip(delta_deg, -args.max_delta_deg, args.max_delta_deg)
 
             execute_motion = True
-            if current_joints_deg is None:
-                execute_motion = False
-                target_joints_deg = np.zeros(6, dtype=np.float32)
-            else:
-                target_joints_deg = delta_deg  # action = 절대 next-position (degree), delta 가산 아님
+            if args.input_layout != "e6_v1":
+                if current_joints_deg is None:
+                    execute_motion = False
+                    target_joints_deg = np.zeros(6, dtype=np.float32)
+                else:
+                    target_joints_deg = current_joints_deg[:6] + delta_deg
 
             # ── Z 안전 한계 ──────────────────────────────────────────────────
             if current_tool_z is not None and current_tool_z <= args.min_tool_z:

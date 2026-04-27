@@ -14,7 +14,8 @@ inference_bridge_node — obs 조립 → WebSocket 추론 → action_chunk 발�
 파라미터:
   server_host  (str,   default "127.0.0.1")
   server_port  (int,   default 8000)
-  infer_hz     (float, default 1.25)  — action_horizon(16) / hz(20) ≈ 0.8s 주기
+  infer_hz          (float, default 1.25)   — action_horizon(16) / hz(20) ≈ 0.8s 주기
+  save_debug_images (bool,  default False)  — 추론마다 HIK+ZED 이미지 ~/debug_inference/ 저장
 """
 from __future__ import annotations
 
@@ -51,11 +52,18 @@ class InferenceBridgeNode(Node):
         # 파라미터
         self.declare_parameter("server_host", "127.0.0.1")
         self.declare_parameter("server_port", 8000)
-        self.declare_parameter("infer_hz", 1.25)   # ~0.8s 주기
+        self.declare_parameter("infer_hz", 1.25)
+        self.declare_parameter("save_debug_images", False)
 
         host = self.get_parameter("server_host").value
         port = self.get_parameter("server_port").value
         infer_hz = self.get_parameter("infer_hz").value
+        self._save_debug = self.get_parameter("save_debug_images").value
+        self._debug_dir = Path.home() / "debug_inference"
+        self._debug_count = 0
+        if self._save_debug:
+            self._debug_dir.mkdir(parents=True, exist_ok=True)
+            self.get_logger().info(f"디버그 이미지 저장: {self._debug_dir}")
 
         # 최신 obs 캐시 (항상 가장 최근 값 유지)
         self._latest_img: np.ndarray | None = None      # HIK
@@ -66,6 +74,7 @@ class InferenceBridgeNode(Node):
 
         # 추론 상태
         self._inference_running = False
+        self._task_complete = False
         self._executor = ThreadPoolExecutor(max_workers=1)
 
         # 구독
@@ -76,7 +85,8 @@ class InferenceBridgeNode(Node):
         qos_transient = QoSProfile(
             durability=DurabilityPolicy.TRANSIENT_LOCAL, depth=1
         )
-        self.create_subscription(String, "/e6/task/prompt", self._cb_prompt, qos_transient)
+        self.create_subscription(String, "/e6/task/prompt",  self._cb_prompt,      qos_transient)
+        self.create_subscription(String, "/e6/task/status",  self._cb_task_status, 10)
 
         # 발행
         self._chunk_pub = self.create_publisher(Float32MultiArray, "/e6/policy/action_chunk", 10)
@@ -139,6 +149,13 @@ class InferenceBridgeNode(Node):
         with self._lock:
             self._latest_state = np.array(msg.data, dtype=np.float32)
 
+    def _cb_task_status(self, msg: String):
+        if not self._task_complete and (
+            msg.data == "TASK_COMPLETE" or msg.data.startswith("FAIL_SAFETY")
+        ):
+            self._task_complete = True
+            self.get_logger().info(f"추론 정지 ({msg.data})")
+
     def _cb_prompt(self, msg: String):
         with self._lock:
             self._latest_prompt = msg.data
@@ -147,7 +164,7 @@ class InferenceBridgeNode(Node):
     # ── 추론 트리거 ──────────────────────────────────────────────────────────
 
     def _maybe_infer(self):
-        if self._policy is None:
+        if self._policy is None or self._task_complete:
             return
         if self._inference_running:
             return  # 이전 추론 진행 중 → 스킵
@@ -171,8 +188,26 @@ class InferenceBridgeNode(Node):
             "observation/state":                 state.copy(),
             "prompt":                            prompt,
         }
+        # 디버그 이미지 저장 (매 추론마다)
+        if self._save_debug:
+            self._save_debug_images(obs)
+
         self._inference_running = True
         self._executor.submit(self._run_infer, obs)
+
+    def _save_debug_images(self, obs: dict):
+        try:
+            import cv2  # type: ignore
+            n = self._debug_count
+            hik = obs["observation/exterior_image_1_left"]
+            zed = obs["observation/exterior_image_2_left"]
+            cv2.imwrite(str(self._debug_dir / f"{n:04d}_hik.jpg"),
+                        cv2.cvtColor(hik, cv2.COLOR_RGB2BGR))
+            cv2.imwrite(str(self._debug_dir / f"{n:04d}_zed.jpg"),
+                        cv2.cvtColor(zed, cv2.COLOR_RGB2BGR))
+            self._debug_count += 1
+        except Exception as exc:
+            self.get_logger().warn(f"디버그 이미지 저장 실패: {exc}", throttle_duration_sec=5.0)
 
     def _run_infer(self, obs: dict):
         try:
