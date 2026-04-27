@@ -46,6 +46,8 @@ REPO="$(cd "$(dirname "$0")" && pwd)"
 source ~/move-one/min-imum/move-one/bin/activate
 
 export MVCAM_COMMON_RUNENV=/opt/MVS/lib
+export PYTHONPATH="$REPO/src:$PYTHONPATH"
+export LD_LIBRARY_PATH="$HOME/DobotControl/min-imum/move-one/lib/python3.10/site-packages/nvidia/cusparselt/lib:$LD_LIBRARY_PATH"
 
 echo "=============================="
 echo " e6-vla 로봇 클라이언트"

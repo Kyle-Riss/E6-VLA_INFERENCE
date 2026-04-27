@@ -1,8 +1,10 @@
+import datetime
+
 from launch import LaunchDescription
 from launch_ros.actions import Node
 from launch.actions import DeclareLaunchArgument, ExecuteProcess
 from launch.conditions import IfCondition
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import LaunchConfiguration, PythonExpression
 
 
 def generate_launch_description():
@@ -28,6 +30,7 @@ def generate_launch_description():
         DeclareLaunchArgument("movj_accel",          default_value="60"),
         DeclareLaunchArgument("record_mcap",         default_value="false"),
         DeclareLaunchArgument("mcap_output_dir",     default_value="/media/billye6/새 볼륨/Dobot/inference_mcap"),
+        DeclareLaunchArgument("mcap_session_id",     default_value=datetime.datetime.now().strftime("%Y%m%d_%H%M%S")),
 
         # ── 노드 1: camera_state_node ──────────────────────────────────────
         Node(
@@ -98,7 +101,10 @@ def generate_launch_description():
             cmd=[
                 "ros2", "bag", "record",
                 "--storage", "mcap",
-                "--output", LaunchConfiguration("mcap_output_dir"),
+                "--output", PythonExpression([
+                    "'", LaunchConfiguration("mcap_output_dir"), "/' + '",
+                    LaunchConfiguration("mcap_session_id"), "'"
+                ]),
                 "/e6/camera/image",
                 "/e6/camera/zed_image",
                 "/e6/robot/state",
