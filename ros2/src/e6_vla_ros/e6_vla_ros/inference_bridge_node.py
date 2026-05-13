@@ -54,11 +54,13 @@ class InferenceBridgeNode(Node):
         self.declare_parameter("server_port", 8000)
         self.declare_parameter("infer_hz", 1.25)
         self.declare_parameter("save_debug_images", False)
+        self.declare_parameter("action_mode", "absolute")  # "absolute" (v6) | "delta" (v8)
 
         host = self.get_parameter("server_host").value
         port = self.get_parameter("server_port").value
         infer_hz = self.get_parameter("infer_hz").value
         self._save_debug = self.get_parameter("save_debug_images").value
+        self._action_mode = self.get_parameter("action_mode").value
         self._debug_dir = Path.home() / "debug_inference"
         self._debug_count = 0
         if self._save_debug:
@@ -69,13 +71,14 @@ class InferenceBridgeNode(Node):
         self._latest_img: np.ndarray | None = None      # HIK
         self._latest_zed: np.ndarray | None = None      # ZED
         self._latest_state: np.ndarray | None = None
-        self._latest_prompt: str = "approach red object"
+        self._latest_prompt: str = "pick up the orange box from the left side and place it on the right side"
         self._lock = threading.Lock()
 
         # 추론 상태
         self._inference_running = False
         self._task_complete = False
         self._executor = ThreadPoolExecutor(max_workers=1)
+        self._prev_actions: np.ndarray | None = None  # temporal ensembling용
 
         # 구독
         self.create_subscription(Image,             "/e6/camera/image",     self._cb_img,     10)
@@ -158,8 +161,10 @@ class InferenceBridgeNode(Node):
 
     def _cb_prompt(self, msg: String):
         with self._lock:
+            changed = self._latest_prompt != msg.data
             self._latest_prompt = msg.data
-        self.get_logger().info(f"prompt 변경: {msg.data!r}")
+        if changed:
+            self.get_logger().info(f"prompt 변경: {msg.data!r}")
 
     # ── 추론 트리거 ──────────────────────────────────────────────────────────
 
@@ -213,10 +218,35 @@ class InferenceBridgeNode(Node):
         try:
             result = self._policy.infer(obs)
             actions = np.asarray(result["actions"], dtype=np.float32)  # (16, 7)
+            state = obs["observation/state"]
+            delta0  = actions[0,  :6] - state[:6]
+            delta15 = actions[15, :6] - state[:6]
             self.get_logger().info(
                 f"추론 완료 shape={actions.shape} "
                 f"prompt={obs['prompt']!r}"
             )
+            grip_vals = [f"{actions[i,6]:+.3f}" for i in range(len(actions))]
+            self.get_logger().info(f"state:      {np.round(state[:6],1).tolist()}  grip={state[6]:.1f}")
+            self.get_logger().info(f"action[0]:  {np.round(actions[0,:6],1).tolist()}  grip={actions[0,6]:+.3f}")
+            self.get_logger().info(f"action[15]: {np.round(actions[15,:6],1).tolist()}  grip={actions[15,6]:+.3f}")
+            self.get_logger().info(f"grip_seq:   {grip_vals}")
+            self.get_logger().info(
+                f"delta[0]:  {['%+.1f'%d for d in delta0]}  max={np.abs(delta0).max():.1f}°"
+            )
+            self.get_logger().info(
+                f"delta[15]: {['%+.1f'%d for d in delta15]}  max={np.abs(delta15).max():.1f}°"
+            )
+            max_delta0 = np.abs(delta0).max()
+            # J5 부호 반전 = mode flip → reject (absolute mode 전용)
+            # delta mode에서는 act_j5가 속도값이므로 부호 체크 불필요
+            if self._action_mode == "absolute":
+                cur_j5  = float(state[4])
+                act_j5  = float(actions[0, 4])
+                if (cur_j5 < 0) != (act_j5 < 0):
+                    self.get_logger().warn(
+                        f"chunk 거부: J5 부호 반전 cur={cur_j5:.1f}° → act={act_j5:.1f}° (mode flip) → 재추론 대기"
+                    )
+                    return
             msg = Float32MultiArray(data=actions.flatten().tolist())
             self._chunk_pub.publish(msg)
         except Exception as exc:

@@ -34,6 +34,10 @@ class Pi0Config(_model.BaseModelConfig):
 
     pytorch_compile_mode: str | None = None
 
+    vision_lora_rank: int | None = None
+    vision_lora_alpha: float = 16.0
+    vision_lora_layer_range: tuple | None = None
+
     def __post_init__(self):
         if self.max_token_len is None:
             object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)
@@ -115,6 +119,22 @@ class Pi0Config(_model.BaseModelConfig):
         if not filters:
             return nnx.Nothing
         return nnx.All(*filters)
+
+
+def freeze_filter_vlm_frozen_vision_and_action_lora() -> nnx.filterlib.Filter:
+    """Freeze base weights; train vision LoRA + action-expert LoRA + action heads.
+
+    Use with ``vision_lora_rank`` set and ``action_expert_variant`` containing ``lora``.
+    Freezes SigLIP non-LoRA params and LLM non-expert-LoRA params.
+    """
+    llm = nnx_utils.PathRegex("PaliGemma/llm/.*")
+    img = nnx_utils.PathRegex("PaliGemma/img/.*")
+    has_lora = nnx_utils.PathRegex(".*lora.*")
+    has_1 = nnx_utils.PathRegex(".*_1.*")
+    expert_lora = nnx.All(has_lora, has_1)
+    freeze_img = nnx.All(img, nnx.Not(has_lora))
+    freeze_llm = nnx.All(llm, nnx.Not(expert_lora))
+    return nnx.Any(freeze_img, freeze_llm)
 
 
 def freeze_filter_vlm_frozen_action_expert_lora_only() -> nnx.filterlib.Filter:

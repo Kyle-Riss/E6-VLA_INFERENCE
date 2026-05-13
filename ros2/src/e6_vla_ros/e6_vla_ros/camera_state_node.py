@@ -27,7 +27,13 @@ from sensor_msgs.msg import Image
 from std_msgs.msg import Float32MultiArray, Float32
 
 # ── 경로 설정 ────────────────────────────────────────────────────────────────
-_REPO = Path(__file__).resolve().parents[4]          # e6-vla/
+def _find_repo_root() -> Path:
+    for parent in Path(__file__).resolve().parents:
+        if (parent / "hardware" / "dobot" / "dobot_api.py").exists():
+            return parent
+    raise RuntimeError("repo root (hardware/dobot/dobot_api.py) not found")
+
+_REPO = _find_repo_root()
 _HARDWARE = _REPO / "hardware"
 _DOBOT_SDK = _HARDWARE / "dobot"
 for _p in [str(_HARDWARE), str(_DOBOT_SDK)]:
@@ -74,6 +80,7 @@ class CameraStateNode(Node):
         self._zed = None
         self._zed_mat = None
         self._last_gripper = 0.0
+        self._last_zed_frame: np.ndarray | None = None  # grab 실패 시 직전 유효 프레임 재사용
 
         if not self._dry_run:
             self._init_robot(robot_ip)
@@ -173,7 +180,7 @@ class CameraStateNode(Node):
     def _read_zed_frame(self) -> np.ndarray:
         H = W = 224
         if self._zed is None or self._zed_mat is None:
-            return np.zeros((H, W, 3), dtype=np.uint8)
+            return self._last_zed_frame if self._last_zed_frame is not None else np.zeros((H, W, 3), dtype=np.uint8)
         try:
             import cv2  # type: ignore
             import pyzed.sl as sl  # type: ignore
@@ -186,10 +193,12 @@ class CameraStateNode(Node):
                 frame = cv2.resize(frame, (640, 480))
                 frame = frame[120:480, 150:510]
                 frame = cv2.resize(frame, (W, H))
-                return frame.astype(np.uint8)
+                self._last_zed_frame = frame.astype(np.uint8)
+                return self._last_zed_frame
         except Exception as exc:
             self.get_logger().warn(f"ZED 카메라 읽기 실패: {exc}", throttle_duration_sec=5.0)
-        return np.zeros((H, W, 3), dtype=np.uint8)
+        # grab 실패 시 직전 유효 프레임 재사용 (zeros 대신)
+        return self._last_zed_frame if self._last_zed_frame is not None else np.zeros((H, W, 3), dtype=np.uint8)
 
     # ── 로봇 상태 읽기 ──────────────────────────────────────────────────────
 

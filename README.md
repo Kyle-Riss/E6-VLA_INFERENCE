@@ -5,152 +5,154 @@ Dobot E6 로봇 팔을 위한 π0.5 VLA(Vision-Language-Action) 추론 파이프
 
 ## 아키텍처
 
-### 단일 스크립트 모드 (기본)
-
-```
-[serve_policy.py]  ←── WebSocket ──→  [run_e6_client.py]  ──→  Dobot E6
-  정책 서버 (π0.5 추론)                  로봇 제어 클라이언트       192.168.5.1
-```
-
-- **serve_policy.py** — 체크포인트를 로드해 WebSocket으로 obs → actions 서빙
-- **run_e6_client.py** — 카메라 + 로봇 상태 수집 → 서버로 전송 → MovJ / ToolDO 실행
-
-### ROS2 모드 (`feature/ros2-integration`)
-
 ```
 [serve_policy.py]  ←── WebSocket ──→  [inference_bridge_node]
-                                       [camera_state_node]      ──→  Dobot E6
-                                       [executor_supervisor_node]
+  정책 서버 (π0.5 추론)                [camera_state_node]      ──→  Dobot E6
+                                       [executor_supervisor_node]    192.168.5.1
                                        [task_node]
 ```
 
-- 추론 중에도 로봇이 이전 chunk로 계속 동작 (비블로킹)
-- 안전 감시 / 긴급 정지 서비스 독립 실행
-- task_sequence 상태머신으로 stage 자동 전환
-- 상세: [ROS2 플로우차트](docs/ROS2_FLOWCHART.md) / [ROS2 아키텍처](docs/ROS2_ARCHITECTURE.md)
+ROS2 노드 4개로 구성:
+
+| 노드 | 역할 |
+|------|------|
+| `camera_state_node` | HIK(top) + ZED(scene) 카메라 → `/e6/camera/image`, `/e6/camera/zed_image` |
+| `inference_bridge_node` | obs 조립 → WebSocket 정책 서버 → `/e6/policy/action_chunk` |
+| `executor_supervisor_node` | action_chunk 수신 → MovJ/ToolDO 실행 + 종료 조건 감시 |
+| `task_node` | 프롬프트 발행, TASK_COMPLETE 중계 |
 
 ## 요구 환경
 
 - Jetson AGX Orin (aarch64, JetPack 6)
 - Python 3.10
 - HIKRobot MVS SDK (`/opt/MVS/`)
+- ZED SDK (ZED 카메라 사용 시)
 - Dobot E6 (TCP/IP, 192.168.5.1)
-- 가상환경: move-one venv (`~/move-one/min-imum/move-one/bin/activate`)
+- 가상환경: `~/move-one/min-imum/move-one/bin/activate`
 
-## Jetson 환경 주의사항
+## 빠른 시작 (v13)
 
-- **HIKRobot SDK 경로**: `MVCAM_COMMON_RUNENV=/opt/MVS/lib` (lib64 아님 — aarch64 `.so`는 `/opt/MVS/lib/aarch64/`에 위치)
-- **torch.compile 비활성화**: Jetson aarch64는 Triton 미지원 → `pytorch_compile_mode=None`, `TORCHDYNAMO_DISABLE=1` 설정 필요 (run_server.sh, pi0_config.py에 반영됨)
-
-## 빠른 시작
-
-### 1. 가상환경 활성화
+### 터미널 1 — 정책 서버
 
 ```bash
-source ~/move-one/min-imum/move-one/bin/activate
-export MVCAM_COMMON_RUNENV=/opt/MVS/lib
+cd ~/E6-VLA_INFERENCE
+bash run_server_v13.sh /media/billy/새\ 볼륨2/e6_v13_22k
 ```
 
-### 2. 정책 서버 실행 (터미널 1)
+### 터미널 2 — ROS2 추론
 
 ```bash
-bash ~/e6-vla/run_server.sh /path/to/checkpoint/XXXXX
+cd ~/E6-VLA_INFERENCE/ros2
+source install/setup.bash
+
+ros2 launch e6_vla_ros e6_vla.launch.py \
+  prompt_mode:=single \
+  source_side:=left \
+  action_mode:=delta \
+  max_delta_deg:=5.0
 ```
 
-### 3. 로봇 클라이언트 실행 (터미널 2)
+### 주요 launch 인자
 
-```bash
-bash ~/e6-vla/run_client.sh --prompt "approach red object"
-```
+| 인자 | 기본값 | 설명 |
+|------|--------|------|
+| `action_mode` | `delta` | `delta` / `absolute` |
+| `prompt_mode` | `single` | `single` (v13) / `per_frame` (v8~v12) |
+| `source_side` | `left` | 오렌지 박스 시작 위치 (`left` / `right`) |
+| `prompt_variant` | `-1` | 0~2 고정 선택, -1이면 랜덤 |
+| `max_delta_deg` | `5.0` | delta 클램핑 상한 (degree) |
+| `max_steps` | `500` | 강제 종료 스텝 수 (안전망) |
+| `min_steps` | `100` | 정상 종료 감지 시작 스텝 |
+| `home_tol_deg` | `5.0` | 초기 자세 복귀 허용 오차 (degree) |
+| `home_consec_req` | `16` | 복귀 판정 연속 프레임 수 |
+| `record_mcap` | `false` | MCAP 기록 켜기 |
+| `foxglove` | `false` | Foxglove Bridge 실시간 스트리밍 |
+| `task_sequence` | `approach` | 실행할 stage (쉼표 구분) |
 
-### 파이프라인 테스트 (로봇·카메라 없이)
-
-```bash
-# 터미널 1
-PYTHONPATH=~/e6-vla/src python ~/e6-vla/scripts/serve_dummy.py --port 8000
-
-# 터미널 2
-bash ~/e6-vla/run_client.sh --dry_run --no_camera --no_init_pose --max_runtime_sec 10
-```
-
-## 관측 / 액션 계약 (pi05_e6_v1_lora 기준)
+## 관측 / 액션 계약
 
 ### 관측 (obs)
 
 | 키 | Shape | 설명 |
 |----|-------|------|
-| `observation/exterior_image_1_left` | (224, 224, 3) uint8 | 탑뷰 카메라 RGB |
+| `observation/exterior_image_1_left` | (224, 224, 3) uint8 | HIK 탑뷰 카메라 RGB |
+| `observation/exterior_image_2_left` | (224, 224, 3) uint8 | ZED 씬 카메라 RGB |
 | `observation/state` | (7,) float32 | [j1..j6 deg, gripper 0~1] |
 | `prompt` | str | 태스크 지시 문구 |
 
-### 액션 (actions)
+### 카메라 전처리
+
+| 카메라 | 파이프라인 |
+|--------|-----------|
+| HIK | 640×480 → 320×240 → crop[16:240, 55:279] → **224×224** |
+| ZED | HD1080 → 640×480 → crop[120:480, 150:510] → 360×360 → **224×224** |
+
+### 액션 (v8 이후)
 
 | 인덱스 | 의미 |
 |--------|------|
-| `[:, 0:6]` | 관절 Δ각 (degree) |
-| `[:, 6]` | 그리퍼 절대값 (0=열림, 1=닫힘) |
+| `[:, 0:6]` | 관절 velocity delta (deg/frame) |
+| `[:, 6]` | 그리퍼 delta (누산: `clip(grip_cont + Δ, 0, 1)`) |
 
-- action_horizon: 16 / 제어 주기: 20Hz 권장
+- action_horizon: **16** / 실행: 앞 8개 / 제어 주기: **16Hz**
+- state 입력: 7D 절대값 [j1..j6 deg, gripper]
 
-### 태스크 프롬프트 목록
+## 종료 조건 (v13)
 
-```
-"approach red object"
-"pick red object"
-"move object to left / right / middle"
-"place object to left / right / middle"
-"return"
-```
+| 조건 | 설명 |
+|------|------|
+| **B (안전망)** | `step_count > max_steps(500)` → 강제 종료 |
+| **C (정상)** | `step_count > min_steps(100)` 이후 j1~j3이 INIT_POSE `[91.3, 37.7, 53.8]°` ±5° 이내 16프레임 연속 |
 
-## 지원 Config
+## 지원 모델
 
-| Config | 입력 계약 | 액션 | 비고 |
-|--------|-----------|------|------|
-| `pi05_e6_v1_lora` | E6Inputs (state deg 7D) | (16, 7) Δdeg | **메인** |
-| `pi05_e6_v1` | E6Inputs | (16, 7) Δdeg | LoRA 미적용 |
-| `pi0_e6_freeze_vlm_primitive_176_local` | DroidInputs (joint_pos rad 8D) | (10, 8) Δrad | 이전 버전 |
-| `pi0_e6_freeze_vlm_primitive_176_local_ur5` | DroidInputs (wrist=zeros) | (10, 8) Δrad | UR5-style |
+| Config | 데이터셋 | Action | Prompt | 체크포인트 |
+|--------|---------|--------|--------|-----------|
+| `pi05_e6_v8_lora` | v8 | delta | per_frame | `pytorch_from_jax_v8_lora_merged` |
+| `pi05_e6_v9_lora` | v8 | delta | per_frame | `pytorch_from_jax_v9_lora_merged` |
+| `pi05_e6_v10_lora` | v10 | delta | per_frame | `e6_checkpoints/e6_v10_50k` |
+| `pi05_e6_v11_lora` | v10 | delta | per_frame | `e6_checkpoints/e6_v11_30k` |
+| `pi05_e6_v12_lora` | v10 | delta | per_frame | `e6_checkpoints/e6_v12_30k` |
+| `pi05_e6_v13_lora` | v13 | delta | single | `e6_v13_22k` |
+
+> 체크포인트 기본 경로: `/media/billy/새 볼륨2/` (v13) / `/media/billye6/새 볼륨/e6_checkpoints/` (v8~v12)
 
 ## 파일 구조
 
 ```
-e6-vla/
-├── run_server.sh                      # 서버 실행 (체크포인트 경로 인자)
-├── run_client.sh                      # 클라이언트 실행
+E6-VLA_INFERENCE/
+├── run_server_v8.sh ~ run_server_v13.sh   # 버전별 정책 서버 실행 스크립트
 ├── scripts/
-│   ├── serve_policy.py                # 실제 모델 서버
-│   └── serve_dummy.py                 # 파이프라인 테스트용 더미 서버
+│   ├── serve_policy.py                    # 정책 서버 (WebSocket)
+│   ├── test_train_image_infer.py          # 학습 이미지 기반 추론 테스트
+│   └── test_grounding.py                  # 카메라/state grounding 검증
 ├── examples/e6/
-│   ├── run_e6_client.py               # 로봇 제어 클라이언트
-│   └── e6_v1_task_contract.py         # 태스크 프롬프트 정의
-├── hardware/
-│   ├── camera_capture.py              # HIKRobot MVS 카메라
-│   ├── dobot/dobot_api.py             # Dobot E6 TCP 제어
-│   └── utils/                         # 연결 테스트 유틸
-├── ros2/                              # ROS2 파이프라인 (feature/ros2-integration)
-│   └── src/e6_vla_ros/
-│       ├── e6_vla_ros/
-│       │   ├── camera_state_node.py       # HIKRobot + feedBack 20Hz 발행
-│       │   ├── inference_bridge_node.py   # obs 조립 + WebSocket 추론
-│       │   ├── executor_supervisor_node.py# MovJ/ToolDO + 안전 감시
-│       │   └── task_node.py               # task_sequence 상태머신
-│       └── launch/e6_vla.launch.py        # 전체 런치
-├── src/openpi/                        # 모델 아키텍처 (serve_policy 의존)
-├── packages/openpi-client/            # WebSocket 클라이언트
-├── setup/                             # Jetson 환경 설정 스크립트
-└── docs/                              # 상세 문서
-    ├── ROS2_FLOWCHART.md              # ROS2 파이프라인 플로우차트
-    ├── ROS2_ARCHITECTURE.md           # ROS2 아키텍처 설계
-    └── ROS2_IMPLEMENTATION_PLAN.md    # ROS2 구현 계획
+│   └── run_e6_client.py                   # 단일 스크립트 모드 클라이언트
+├── ros2/src/e6_vla_ros/e6_vla_ros/
+│   ├── camera_state_node.py               # HIK + ZED 카메라 퍼블리셔
+│   ├── inference_bridge_node.py           # obs 조립 + WebSocket 추론
+│   ├── executor_supervisor_node.py        # MovJ/ToolDO + 종료 감시
+│   └── task_node.py                       # 프롬프트 발행 + TASK_COMPLETE 중계
+├── ros2/src/e6_vla_ros/launch/
+│   └── e6_vla.launch.py                   # 전체 런치 파일
+└── src/openpi/
+    ├── models/                            # 모델 아키텍처
+    └── training/config.py                 # 버전별 TrainConfig 정의
 ```
 
-## 상세 문서
+## Jetson 환경 주의사항
 
-- [전체 사용 가이드](docs/USAGE.md)
-- [추론 파이프라인](docs/INFERENCE.md)
-- [로봇 추론 가이드](docs/ROBOT_INFERENCE.md)
-- [ROS2 플로우차트](docs/ROS2_FLOWCHART.md)
-- [ROS2 아키텍처](docs/ROS2_ARCHITECTURE.md)
+- **HIKRobot SDK**: `MVCAM_COMMON_RUNENV=/opt/MVS/lib` (lib64 아님 — aarch64 `.so`는 `/opt/MVS/lib/aarch64/`)
+- **torch.compile 비활성화**: Jetson aarch64는 Triton 미지원 → `TORCHDYNAMO_DISABLE=1`
+- **cusparseLt**: `LD_LIBRARY_PATH`에 `nvidia/cusparselt/lib` 추가 필요 (torch GPU 초기화)
+
+## Foxglove 실시간 모니터링
+
+```bash
+ros2 launch e6_vla_ros e6_vla.launch.py foxglove:=true record_mcap:=true
+```
+
+Foxglove Studio → `ws://100.76.114.107:8765` (Tailscale IP)
 
 ## 관련 레포
 

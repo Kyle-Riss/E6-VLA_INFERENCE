@@ -33,9 +33,15 @@ executor_supervisor_node — 액션 실행 + 안전 감시
   stage_done_steps      (int,   default 3)    — 완료 조건 연속 만족 스텝 수
   bad_camera_consecutive(int,   default 10)
   camera_black_mean     (float, default 8.0)
+  max_steps             (int,   default 500)  — 안전망 B: step 초과 시 강제 종료 (31초@16Hz)
+  min_steps             (int,   default 100)  — 종료 체크 시작 최소 step 수 (6초 가드)
+  home_tol_deg          (float, default 5.0)  — 종료 조건 C: j1..j3 init 오차 허용 범위 (deg)
+  home_consec_req       (int,   default 16)   — 종료 조건 C: 연속 만족 프레임 수 (1초@16Hz)
 """
 from __future__ import annotations
 
+import re
+import signal
 import sys
 import threading
 import time
@@ -49,7 +55,13 @@ from std_msgs.msg import Float32MultiArray, Float32, String
 from std_srvs.srv import Trigger
 
 # ── Dobot SDK 경로 ───────────────────────────────────────────────────────────
-_REPO = Path(__file__).resolve().parents[4]
+def _find_repo_root() -> Path:
+    for parent in Path(__file__).resolve().parents:
+        if (parent / "hardware" / "dobot" / "dobot_api.py").exists():
+            return parent
+    raise RuntimeError("repo root (hardware/dobot/dobot_api.py) not found")
+
+_REPO = _find_repo_root()
 _HARDWARE = _REPO / "hardware"
 _DOBOT_SDK = _HARDWARE / "dobot"
 for _p in [str(_HARDWARE), str(_DOBOT_SDK)]:
@@ -69,6 +81,8 @@ class ExecutorSupervisorNode(Node):
         self.declare_parameter("robot_ip", "192.168.5.1")
         self.declare_parameter("dry_run", False)
         self.declare_parameter("no_camera", False)
+        self.declare_parameter("action_mode", "absolute")  # "absolute" (v6) | "delta" (v8)
+        self.declare_parameter("action_scale", 1.0)        # delta mode 출력 배율 (속도 조절)
         self.declare_parameter("max_delta_deg", 3.0)
         self.declare_parameter("min_tool_z", 101.0)
         self.declare_parameter("grip_close_threshold", 0.5)
@@ -78,15 +92,26 @@ class ExecutorSupervisorNode(Node):
         self.declare_parameter("movj_accel", 60)
         self.declare_parameter("chunk_staleness_sec", 5.0)
         self.declare_parameter("steps_per_inference", 8)
-        self.declare_parameter("executor_hz", 18.0)
+        self.declare_parameter("executor_hz", 16.0)
         self.declare_parameter("approach_z_done", 85.0)
         self.declare_parameter("lift_z_done", 200.0)
         self.declare_parameter("stage_done_steps", 3)
         self.declare_parameter("bad_camera_consecutive", 10)
+        self.declare_parameter("vacuum_check_enabled", False)
+        self.declare_parameter("vacuum_check_z", 85.0)
+        self.declare_parameter("vacuum_timeout_sec", 1.0)
         self.declare_parameter("camera_black_mean", 8.0)
+        self.declare_parameter("place_force_release_enabled", False)
+        self.declare_parameter("place_z_threshold", 120.0)
+        self.declare_parameter("max_steps", 500)
+        self.declare_parameter("min_steps", 100)
+        self.declare_parameter("home_tol_deg", 5.0)
+        self.declare_parameter("home_consec_req", 16)
 
         self._dry_run = self.get_parameter("dry_run").value
         self._no_camera = self.get_parameter("no_camera").value
+        self._action_mode = self.get_parameter("action_mode").value
+        self._action_scale = self.get_parameter("action_scale").value
         self._max_delta = self.get_parameter("max_delta_deg").value
         self._min_tool_z = self.get_parameter("min_tool_z").value
         self._grip_close = self.get_parameter("grip_close_threshold").value
@@ -102,7 +127,16 @@ class ExecutorSupervisorNode(Node):
         self._lift_z_done = self.get_parameter("lift_z_done").value
         self._stage_done_steps = self.get_parameter("stage_done_steps").value
         self._bad_cam_limit = self.get_parameter("bad_camera_consecutive").value
+        self._vacuum_check_enabled = self.get_parameter("vacuum_check_enabled").value
+        self._vacuum_check_z = self.get_parameter("vacuum_check_z").value
+        self._vacuum_timeout_sec = self.get_parameter("vacuum_timeout_sec").value
         self._black_mean = self.get_parameter("camera_black_mean").value
+        self._place_force_release_enabled = self.get_parameter("place_force_release_enabled").value
+        self._place_z_threshold = self.get_parameter("place_z_threshold").value
+        self._max_steps = self.get_parameter("max_steps").value
+        self._min_steps = self.get_parameter("min_steps").value
+        self._home_tol_deg = self.get_parameter("home_tol_deg").value
+        self._home_consec_req = self.get_parameter("home_consec_req").value
 
         # 청크 상태
         self._chunk: np.ndarray | None = None       # (16, 7)
@@ -115,6 +149,7 @@ class ExecutorSupervisorNode(Node):
         self._tcp_z: float | None = None
         self._last_gripper = 0
         self._grip_latch_remaining = 0
+        self._grip_cont = 0.0  # delta 모드 연속 gripper 누산기
 
         # 안전 감시 상태
         self._bad_streak = 0
@@ -126,8 +161,19 @@ class ExecutorSupervisorNode(Node):
         self._done_streak = 0              # 완료 조건 연속 만족 카운트
         self._stage_done_published = False # 같은 stage에서 중복 발행 방지
 
+        # 흡착 확인 (ToolDI 기반) — 값은 get_parameter에서 설정됨
+        self._gripper_on_since: float | None = None  # gripper ON 시작 시각
+        self._vacuum_confirmed = False                # 이 에피소드에서 흡착 확인됨
+        self._arm_crossed_transport = False           # vacuum 확인 후 lift_z_done 통과 여부
+
         # task 완료 플래그
         self._task_complete = False
+
+        # B+C 종료 조건 상태
+        self._step_count = 0
+        self._home_consec = 0
+        # j1..j3 기준 init 자세 (INIT_POSE_DEG 고정값 사용)
+        self._init_joints_j123 = np.array(self.INIT_POSE_DEG[:3], dtype=np.float32)
 
         # 구독
         self.create_subscription(Float32MultiArray, "/e6/policy/action_chunk", self._cb_chunk,       10)
@@ -162,8 +208,8 @@ class ExecutorSupervisorNode(Node):
 
     # ── 초기화 ──────────────────────────────────────────────────────────────
 
-    # e6_v1 학습 데이터 기준 초기 자세 (degree)
-    INIT_POSE_DEG = [90.128, 42.907, 59.355, -11.702, -87.582, 177.813]
+    # e6_v10 학습 데이터 기준 초기 자세 (degree) — robot_server.py V10_JOINT_HOME
+    INIT_POSE_DEG = [91.3, 37.7, 53.8, -1.5, -87.8, 173.3]
 
     def _init_robot(self, robot_ip: str):
         try:
@@ -176,6 +222,13 @@ class ExecutorSupervisorNode(Node):
             self.get_logger().info(f"초기 자세 이동 중: {self.INIT_POSE_DEG}")
             time.sleep(3.0)
             self.get_logger().info(f"Dobot dashboard 연결: {robot_ip}:29999")
+        except KeyboardInterrupt:
+            if self._dashboard is not None:
+                try:
+                    self._dashboard.StopRobot()
+                except Exception:
+                    pass
+            raise
         except Exception as exc:
             self.get_logger().warn(f"Dobot 연결 실패 ({exc}) → dry_run 모드")
             self._dashboard = None
@@ -230,6 +283,11 @@ class ExecutorSupervisorNode(Node):
             self._current_stage = stage
             self._done_streak = 0
             self._stage_done_published = False
+            # approach로 돌아오면 흡착 상태 리셋 (새 에피소드)
+            if stage == "approach":
+                self._gripper_on_since = None
+                self._vacuum_confirmed = False
+                self._arm_crossed_transport = False
 
     # ── 20Hz 실행 루프 ───────────────────────────────────────────────────────
 
@@ -243,6 +301,12 @@ class ExecutorSupervisorNode(Node):
             chunk_t = self._chunk_t
 
         if chunk is None:
+            # 청크 없어도 마지막 gripper 상태 유지 (흡착 해제 방지)
+            if self._dashboard is not None and not self._dry_run:
+                try:
+                    self._dashboard.ToolDO(1, self._last_gripper)
+                except Exception:
+                    pass
             return
 
         # staleness 체크
@@ -257,11 +321,38 @@ class ExecutorSupervisorNode(Node):
 
         a = chunk[idx]  # (7,)
 
-        # 절대 목표 관절각 (e6_v1: action = 절대 degree next-position)
-        target_deg = np.asarray(a[:6], dtype=np.float32)
+        if self._action_mode == "delta":
+            # v8: velocity delta — action[:6] = deg/frame, 현재 위치에 누산
+            delta = np.asarray(a[:6], dtype=np.float32) * self._action_scale
+            clipped = np.abs(delta) > self._max_delta
+            if clipped.any():
+                delta = np.clip(delta, -self._max_delta, self._max_delta)
+                self.get_logger().warn(
+                    f"delta clamp: joints {np.where(clipped)[0].tolist()} "
+                    f"max={np.abs(delta).max():.2f}°",
+                    throttle_duration_sec=1.0,
+                )
+            target_deg = self._current_deg + delta
+        else:
+            # v6: 절대 목표 관절각 (action = next-position degree)
+            target_deg = np.asarray(a[:6], dtype=np.float32)
+            delta = target_deg - self._current_deg
+            clipped = np.abs(delta) > self._max_delta
+            if clipped.any():
+                target_deg = self._current_deg + np.clip(delta, -self._max_delta, self._max_delta)
+                self.get_logger().warn(
+                    f"delta clamp: joints {np.where(clipped)[0].tolist()} "
+                    f"max={np.abs(delta).max():.2f}°",
+                    throttle_duration_sec=1.0,
+                )
 
         # 그리퍼 hysteresis
-        grip_raw = float(a[6]) if len(a) > 6 else 0.0
+        if self._action_mode == "delta":
+            # v8: delta 누산 후 hysteresis
+            self._grip_cont = float(np.clip(self._grip_cont + (a[6] if len(a) > 6 else 0.0), 0.0, 1.0))
+            grip_raw = self._grip_cont
+        else:
+            grip_raw = float(a[6]) if len(a) > 6 else 0.0
         if grip_raw >= self._grip_close:
             hys = 1
         elif grip_raw <= self._grip_open:
@@ -278,6 +369,24 @@ class ExecutorSupervisorNode(Node):
 
         tool_on = int(hys)
 
+        # ── transport 통과 추적 ──────────────────────────────────────────────
+        if (self._vacuum_confirmed
+                and self._tcp_z is not None
+                and self._tcp_z > self._lift_z_done):
+            self._arm_crossed_transport = True
+
+        # ── 강제 release (vacuum 확인 + transport 통과 + place 높이 도달) ────
+        if (self._place_force_release_enabled
+                and self._vacuum_confirmed
+                and self._arm_crossed_transport
+                and self._tcp_z is not None
+                and self._tcp_z <= self._place_z_threshold
+                and tool_on == 1):
+            tool_on = 0
+            self.get_logger().info(
+                f"[PLACE] 강제 release (z={self._tcp_z:.1f}mm ≤ {self._place_z_threshold:.1f}mm)"
+            )
+
         # bad camera → MovJ 스킵 (현재 위치 유지)
         camera_hold = hasattr(self, "_frame_mean") and self._frame_mean < self._black_mean
 
@@ -293,14 +402,85 @@ class ExecutorSupervisorNode(Node):
                 self.get_logger().warn(f"MovJ 실패: {exc}", throttle_duration_sec=2.0)
 
         self._last_gripper = tool_on
+
+        # ── ToolDI 흡착 확인 ────────────────────────────────────────────────
+        # 위치/stage 조건 없이 gripper ON 시 센서값만으로 흡착 판정
+        if (self._vacuum_check_enabled and self._dashboard is not None
+                and not self._vacuum_confirmed):
+            now = time.monotonic()
+            # gripper ON 시점 기록 (z 임계값 이하에서 처음 ON 됐을 때만)
+            if tool_on == 1 and self._gripper_on_since is None:
+                self._gripper_on_since = now
+
+            if self._gripper_on_since is not None:
+                # ToolDI(1) 읽기
+                di = None
+                try:
+                    res = self._dashboard.ToolDI(1)
+                    if res:
+                        m = re.search(r"\{(\d+)\}", str(res))
+                        if m:
+                            di = int(m.group(1))
+                except Exception:
+                    pass
+
+                if di == 1:
+                    # 흡착 확인 → 청크 리셋 + transport 페이즈 전환
+                    self._vacuum_confirmed = True
+                    with self._chunk_lock:
+                        self._chunk = None
+                        self._chunk_idx = 0
+                    self.get_logger().info(
+                        f"[VACUUM] 흡착 확인 (z={self._tcp_z:.1f}mm) → 청크 리셋, transport 전환"
+                        if self._tcp_z is not None else "[VACUUM] 흡착 확인 → 청크 리셋"
+                    )
+                elif (now - self._gripper_on_since) > self._vacuum_timeout_sec:
+                    # timeout → 집기 실패
+                    self.get_logger().warn(
+                        f"[VACUUM] {self._vacuum_timeout_sec:.1f}s 내 흡착 미감지 → pick FAIL"
+                    )
+                    self._emergency_stop = True
+                    self._status = "FAIL_PICK:vacuum_timeout"
+
         with self._chunk_lock:
             self._chunk_idx += 1
+
+        # ── B+C 종료 조건 ─────────────────────────────────────────────────────
+        self._step_count += 1
+
+        # B: 최대 step 초과 → 강제 종료
+        if self._step_count > self._max_steps:
+            self.get_logger().warn(
+                f"TIMEOUT: {self._step_count} step 초과 ({self._max_steps}) → 강제 종료"
+            )
+            self._task_complete = True
+            self._status_pub.publish(String(data="TASK_COMPLETE"))
+            return
+
+        # C: init 자세 복귀 감지 → 정상 종료 (min_steps 이후부터만)
+        if self._step_count > self._min_steps:
+            j_diff = np.abs(self._current_deg[:3] - self._init_joints_j123)
+            if j_diff.max() < self._home_tol_deg:
+                self._home_consec += 1
+                if self._home_consec >= self._home_consec_req:
+                    self.get_logger().info(
+                        f"HOME: j1..j3 init 복귀 {self._home_consec}프레임 연속 "
+                        f"(diff_max={j_diff.max():.2f}°) → 정상 종료"
+                    )
+                    self._task_complete = True
+                    self._status_pub.publish(String(data="TASK_COMPLETE"))
+                    return
+            else:
+                self._home_consec = 0
 
     # ── 10Hz 감시 루프 ───────────────────────────────────────────────────────
 
     def _supervisor_tick(self):
         if self._emergency_stop:
             self._status_pub.publish(String(data="FAIL_SAFETY:emergency_stop"))
+            return
+
+        if self._task_complete:
             return
 
         status = "RUNNING"
@@ -370,13 +550,28 @@ class ExecutorSupervisorNode(Node):
 
 def main(args=None):
     rclpy.init(args=args)
-    node = ExecutorSupervisorNode()
+    node = None
+
+    def _shutdown(signum, frame):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, _shutdown)
+
     try:
+        node = ExecutorSupervisorNode()
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
     finally:
-        node.destroy_node()
+        if node is not None:
+            with node._chunk_lock:
+                node._chunk = None
+            if node._dashboard is not None:
+                try:
+                    node._dashboard.StopRobot()
+                except Exception:
+                    pass
+            node.destroy_node()
         try:
             rclpy.shutdown()
         except Exception:

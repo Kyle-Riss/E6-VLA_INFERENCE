@@ -193,7 +193,7 @@ def main() -> None:
     )
 
     # ── 제어 루프 ─────────────────────────────────────────────────────────────
-    parser.add_argument("--hz", type=float, default=18.0, help="제어 주파수 (학습 데이터 수집 주파수 18Hz에 맞춤)")
+    parser.add_argument("--hz", type=float, default=16.0, help="제어 주파수 (v2 모델 action_horizon=16, 16Hz)")
     parser.add_argument(
         "--steps_per_inference", type=int, default=None,
         help="청크에서 몇 스텝 실행 후 재추론. None=action_horizon 전체"
@@ -222,6 +222,10 @@ def main() -> None:
     parser.add_argument("--grip_close_latch_steps", type=int, default=0)
     parser.add_argument("--z_grip_trigger", type=float, default=None,
                         help="TCP Z(mm) ≤ 이 값 && grip>0 이면 강제 ON")
+    parser.add_argument("--vacuum_check_z", type=float, default=85.0,
+                        help="흡착 확인 Z(mm): TCP Z ≤ 이 값이고 gripper ON인데 ToolDI(1)=0 이면 pick fail 경고")
+    parser.add_argument("--vacuum_check_enabled", action="store_true", default=False,
+                        help="ToolDI(1) 진공 스위치 기반 흡착 확인 활성화")
 
     # ── 카메라 안전 ────────────────────────────────────────────────────────────
     parser.add_argument("--hold_on_bad_camera", action="store_true", default=True)
@@ -376,6 +380,8 @@ def main() -> None:
     _seq_idx: int = 0
     stage_done_streak: int = 0
     loop_tool_z: float | None = None  # 이전 iteration에서 읽은 TCP Z (stage 판정에 사용)
+    vacuum_di_state: int = -1          # ToolDI(1) 최근 값 (-1=미읽음, 0=흡착없음, 1=흡착)
+    vacuum_fail_logged: bool = False   # pick fail 경고 중복 출력 방지
     _V1_CORE = {"approach", "pick", "move_left", "move_right", "move_middle",
                 "place_left", "place_right", "place_middle"}
     if args.task_sequence:
@@ -625,6 +631,25 @@ def main() -> None:
                             ref_joints_deg = current_joints_deg.copy()
                 except Exception as exc:
                     print(f"  피드백 읽기 실패: {exc}")
+
+            # ── 진공 흡착 확인 (ToolDI(1) 보조 신호) ────────────────────────
+            if args.vacuum_check_enabled and dashboard is not None and current_tool_z is not None:
+                if current_tool_z <= args.vacuum_check_z and last_tool_on == 1:
+                    try:
+                        di_res = dashboard.ToolDI(1)
+                        if di_res:
+                            parts = di_res.split(",")
+                            val_str = parts[1].strip().strip("{}") if len(parts) >= 2 else ""
+                            vacuum_di_state = int(val_str) if val_str.isdigit() else vacuum_di_state
+                    except Exception:
+                        pass
+                    if vacuum_di_state == 0 and not vacuum_fail_logged:
+                        print(f"  [PICK_FAIL] z={current_tool_z:.1f}mm gripper=ON but ToolDI(1)=0 — 흡착 미감지")
+                        vacuum_fail_logged = True
+                elif current_tool_z > args.vacuum_check_z:
+                    # z가 올라가면 다음 pick을 위해 플래그 초기화
+                    vacuum_fail_logged = False
+                    vacuum_di_state = -1
 
             # ── 관절 목표 계산 ───────────────────────────────────────────────
             if args.input_layout == "e6_v1":

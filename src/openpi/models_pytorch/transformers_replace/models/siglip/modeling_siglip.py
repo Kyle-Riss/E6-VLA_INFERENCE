@@ -433,13 +433,29 @@ class SiglipMLP(nn.Module):
 
 
 class SiglipEncoderLayer(GradientCheckpointingLayer):
-    def __init__(self, config: Union[SiglipVisionConfig, SiglipTextConfig]):
+    def __init__(self, config: Union[SiglipVisionConfig, SiglipTextConfig], layer_idx: int = 0):
         super().__init__()
         self.embed_dim = config.hidden_size
         self.layer_norm1 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
         self.self_attn = SiglipAttention(config)
         self.layer_norm2 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
         self.mlp = SiglipMLP(config)
+
+        lora_rank = getattr(config, "vision_lora_rank", None)
+        lora_range = getattr(config, "vision_lora_layer_range", None)
+        self._lora_active = (
+            lora_rank is not None
+            and lora_range is not None
+            and lora_range[0] <= layer_idx <= lora_range[1]
+        )
+        if self._lora_active:
+            D, R = self.embed_dim, lora_rank
+            lora_alpha = getattr(config, "vision_lora_alpha", 16.0)
+            self._lora_scaling = lora_alpha / R
+            self.attn_lora_a = nn.Parameter(torch.randn(D, R) * 0.01)
+            self.attn_lora_b = nn.Parameter(torch.randn(R, D) * 0.01)
+            self.mlp_lora_a = nn.Parameter(torch.randn(D, R) * 0.01)
+            self.mlp_lora_b = nn.Parameter(torch.randn(R, D) * 0.01)
 
     def forward(
         self,
@@ -459,18 +475,22 @@ class SiglipEncoderLayer(GradientCheckpointingLayer):
         """
         residual = hidden_states
 
-        hidden_states = self.layer_norm1(hidden_states)
-        hidden_states, attn_weights = self.self_attn(
-            hidden_states=hidden_states,
+        ln1_out = self.layer_norm1(hidden_states)
+        attn_out, attn_weights = self.self_attn(
+            hidden_states=ln1_out,
             attention_mask=attention_mask,
             output_attentions=output_attentions,
         )
-        hidden_states = residual + hidden_states
+        if self._lora_active:
+            attn_out = attn_out + (ln1_out @ self.attn_lora_a @ self.attn_lora_b) * self._lora_scaling
+        hidden_states = residual + attn_out
 
         residual = hidden_states
-        hidden_states = self.layer_norm2(hidden_states)
-        hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
+        ln2_out = self.layer_norm2(hidden_states)
+        mlp_out = self.mlp(ln2_out)
+        if self._lora_active:
+            mlp_out = mlp_out + (ln2_out @ self.mlp_lora_a @ self.mlp_lora_b) * self._lora_scaling
+        hidden_states = residual + mlp_out
 
         outputs = (hidden_states,)
 
@@ -558,7 +578,7 @@ class SiglipEncoder(nn.Module):
     def __init__(self, config: SiglipConfig):
         super().__init__()
         self.config = config
-        self.layers = nn.ModuleList([SiglipEncoderLayer(config) for _ in range(config.num_hidden_layers)])
+        self.layers = nn.ModuleList([SiglipEncoderLayer(config, layer_idx=i) for i in range(config.num_hidden_layers)])
         self.gradient_checkpointing = False
 
     # Ignore copy

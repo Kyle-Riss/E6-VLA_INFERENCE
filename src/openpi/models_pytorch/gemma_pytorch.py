@@ -15,6 +15,9 @@ class PaliGemmaWithExpertModel(nn.Module):
         action_expert_config,
         use_adarms=None,
         precision: Literal["bfloat16", "float32"] = "bfloat16",
+        vision_lora_rank: int | None = None,
+        vision_lora_alpha: float = 16.0,
+        vision_lora_layer_range: tuple | None = None,
     ):
         if use_adarms is None:
             use_adarms = [False, False]
@@ -38,6 +41,9 @@ class PaliGemmaWithExpertModel(nn.Module):
         vlm_config_hf.vision_config.projection_dim = 2048
         vlm_config_hf.vision_config.projector_hidden_act = "gelu_fast"
         vlm_config_hf.vision_config.torch_dtype = "float32"
+        vlm_config_hf.vision_config.vision_lora_rank = vision_lora_rank
+        vlm_config_hf.vision_config.vision_lora_alpha = vision_lora_alpha
+        vlm_config_hf.vision_config.vision_lora_layer_range = vision_lora_layer_range
 
         action_expert_config_hf = CONFIG_MAPPING["gemma"](
             head_dim=action_expert_config.head_dim,
