@@ -30,6 +30,8 @@ def _parse_image(image) -> np.ndarray:
 class E6Inputs(transforms.DataTransformFn):
     # Determines which model will be used.
     model_type: _model.ModelType
+    # v14+: insert dummy 0 at state index 6 → [j1..j6, 0, gripper] 8D
+    use_dummy_joint: bool = False
 
     def __call__(self, data: dict) -> dict:
         hik_image = _parse_image(data["observation/exterior_image_1_left"])
@@ -49,8 +51,13 @@ class E6Inputs(transforms.DataTransformFn):
             case _:
                 raise ValueError(f"Unsupported model type: {self.model_type}")
 
+        state = np.asarray(data["observation/state"])
+        if self.use_dummy_joint and state.shape[0] == 7:
+            # v14: 7D [j1..j6, gripper] → 8D [j1..j6, 0, gripper]
+            state = np.insert(state, 6, 0.0)
+
         inputs = {
-            "state": np.asarray(data["observation/state"]),
+            "state": state,
             "image": dict(zip(names, images, strict=True)),
             "image_mask": dict(zip(names, image_masks, strict=True)),
         }
@@ -68,6 +75,15 @@ class E6Inputs(transforms.DataTransformFn):
 
 @dataclasses.dataclass(frozen=True)
 class E6Outputs(transforms.DataTransformFn):
+    # v14+: remove dummy at action index 6 → [j1..j6, gripper] 7D
+    use_dummy_joint: bool = False
+
     def __call__(self, data: dict) -> dict:
-        # E6 external action contract is 7D: 6 joints + 1 gripper.
-        return {"actions": np.asarray(data["actions"][:, :7])}
+        actions = np.asarray(data["actions"])
+        if self.use_dummy_joint and actions.shape[1] == 8:
+            # v14: 8D [j1..j6, dummy, gripper] → 7D [j1..j6, gripper]
+            actions = np.concatenate([actions[:, :6], actions[:, 7:8]], axis=1)
+        else:
+            # v13 and earlier: take first 7 columns
+            actions = actions[:, :7]
+        return {"actions": actions}

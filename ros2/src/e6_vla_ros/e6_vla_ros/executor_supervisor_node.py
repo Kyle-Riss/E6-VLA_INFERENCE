@@ -37,6 +37,7 @@ executor_supervisor_node — 액션 실행 + 안전 감시
   min_steps             (int,   default 100)  — 종료 체크 시작 최소 step 수 (6초 가드)
   home_tol_deg          (float, default 5.0)  — 종료 조건 C: j1..j3 init 오차 허용 범위 (deg)
   home_consec_req       (int,   default 16)   — 종료 조건 C: 연속 만족 프레임 수 (1초@16Hz)
+  gripper_mode          (str,   default "delta") — "delta": 누산 ±0.5 (v13/v14) | "absolute": action[6] 직접 0.5 threshold (v16/v17)
 """
 from __future__ import annotations
 
@@ -82,6 +83,15 @@ class ExecutorSupervisorNode(Node):
         self.declare_parameter("dry_run", False)
         self.declare_parameter("no_camera", False)
         self.declare_parameter("action_mode", "absolute")  # "absolute" (v6) | "delta" (v8)
+        self.declare_parameter("gripper_mode", "delta")    # "delta" (v13/v14 누산) | "absolute" (v16/v17 직접 threshold)
+        self.declare_parameter("control_mode", "movj")     # "movj" | "servoj"
+        # ServoJ 튜닝 파라미터 (control_mode=servoj 전용)
+        # t: 목표 도달 시간(s). 보통 1/executor_hz 로 설정. -1=Dobot 기본값
+        # aheadtime: PID D항 유사, 범위 [20, 100], -1=기본값(50)
+        # gain: PID P항 유사, 범위 [200, 1000], -1=기본값(500)
+        self.declare_parameter("servoj_t", -1.0)
+        self.declare_parameter("servoj_aheadtime", -1.0)
+        self.declare_parameter("servoj_gain", -1.0)
         self.declare_parameter("action_scale", 1.0)        # delta mode 출력 배율 (속도 조절)
         self.declare_parameter("max_delta_deg", 3.0)
         self.declare_parameter("min_tool_z", 101.0)
@@ -107,11 +117,23 @@ class ExecutorSupervisorNode(Node):
         self.declare_parameter("min_steps", 100)
         self.declare_parameter("home_tol_deg", 5.0)
         self.declare_parameter("home_consec_req", 16)
+        self.declare_parameter("grip_enable_z", 0.0)  # 0=비활성, >0이면 tcp_z > 이 값일 때 gripper 강제 OFF
+        # scripted lift: VLA가 lift phase에서 상승 못할 때 강제 MovL로 올림
+        self.declare_parameter("scripted_lift_enabled", False)   # True=활성화
+        self.declare_parameter("scripted_lift_target_z", 185.0)  # 목표 Z (mm)
+        self.declare_parameter("scripted_lift_wait_frames", 48)  # 대기 프레임 수 (3초@16Hz)
+        self.declare_parameter("scripted_lift_stall_z", 160.0)   # 이 Z 미달이면 stall 판정
+        self.declare_parameter("scripted_lift_dz_thresh", 0.3)   # mm/frame 이하이면 stall
 
         self._dry_run = self.get_parameter("dry_run").value
         self._no_camera = self.get_parameter("no_camera").value
         self._action_mode = self.get_parameter("action_mode").value
+        self._gripper_mode = self.get_parameter("gripper_mode").value
         self._action_scale = self.get_parameter("action_scale").value
+        self._control_mode = self.get_parameter("control_mode").value
+        self._servoj_t = self.get_parameter("servoj_t").value
+        self._servoj_aheadtime = self.get_parameter("servoj_aheadtime").value
+        self._servoj_gain = self.get_parameter("servoj_gain").value
         self._max_delta = self.get_parameter("max_delta_deg").value
         self._min_tool_z = self.get_parameter("min_tool_z").value
         self._grip_close = self.get_parameter("grip_close_threshold").value
@@ -137,6 +159,12 @@ class ExecutorSupervisorNode(Node):
         self._min_steps = self.get_parameter("min_steps").value
         self._home_tol_deg = self.get_parameter("home_tol_deg").value
         self._home_consec_req = self.get_parameter("home_consec_req").value
+        self._grip_enable_z = self.get_parameter("grip_enable_z").value
+        self._scripted_lift_enabled = self.get_parameter("scripted_lift_enabled").value
+        self._scripted_lift_target_z = self.get_parameter("scripted_lift_target_z").value
+        self._scripted_lift_wait_frames = self.get_parameter("scripted_lift_wait_frames").value
+        self._scripted_lift_stall_z = self.get_parameter("scripted_lift_stall_z").value
+        self._scripted_lift_dz_thresh = self.get_parameter("scripted_lift_dz_thresh").value
 
         # 청크 상태
         self._chunk: np.ndarray | None = None       # (16, 7)
@@ -175,6 +203,19 @@ class ExecutorSupervisorNode(Node):
         # j1..j3 기준 init 자세 (INIT_POSE_DEG 고정값 사용)
         self._init_joints_j123 = np.array(self.INIT_POSE_DEG[:3], dtype=np.float32)
 
+        # 시작 자세 확인: canonical home에 도달하기 전 inference chunk 실행 차단
+        # 이유: 이전 에피소드가 OOD 자세(예: j3=46°)로 끝난 뒤 재실행하면
+        #       모델이 학습 분포(j3=53.8°) 밖에서 시작해 near-zero action 출력
+        self._init_hold = True
+        self._init_consec = 0
+
+        # scripted lift 상태
+        self._lift_frame_count = 0        # vacuum 확인 후 경과 프레임
+        self._scripted_lifting = False    # 현재 강제 상승 중
+        self._lift_vacuum_confirmed = False  # lift phase에서 ToolDI=1 확인됨
+        self._scripted_movl_sent = False  # RelMovLUser 1회 발행 완료 여부
+        self._post_lift_grip_hold = 0     # scripted lift 완료 후 grip 유지 잔여 프레임
+
         # 구독
         self.create_subscription(Float32MultiArray, "/e6/policy/action_chunk", self._cb_chunk,       10)
         self.create_subscription(Image,             "/e6/camera/image",         self._cb_img,         10)
@@ -184,7 +225,8 @@ class ExecutorSupervisorNode(Node):
         self.create_subscription(String,            "/e6/task/status",          self._cb_task_status, 10)
 
         # 발행
-        self._status_pub = self.create_publisher(String, "/e6/supervisor/status", 10)
+        self._status_pub      = self.create_publisher(String, "/e6/supervisor/status",    10)
+        self._gripper_cmd_pub = self.create_publisher(Float32, "/e6/gripper/commanded",   10)
 
         # 서비스
         self.create_service(Trigger, "/e6/emergency_stop", self._cb_estop)
@@ -202,6 +244,7 @@ class ExecutorSupervisorNode(Node):
         self.get_logger().info(
             f"executor_supervisor_node 시작 — "
             f"robot={'연결됨' if self._dashboard else 'dry_run'} "
+            f"control_mode={self._control_mode} "
             f"executor_hz={_executor_hz} max_delta={self._max_delta}° "
             f"min_tool_z={self._min_tool_z}mm steps_per_inference={self._steps_per_inference}/{ACTION_HORIZON}"
         )
@@ -220,7 +263,7 @@ class ExecutorSupervisorNode(Node):
             j1, j2, j3, j4, j5, j6 = self.INIT_POSE_DEG
             self._dashboard.MovJ(j1, j2, j3, j4, j5, j6, 1, v=50, a=40)
             self.get_logger().info(f"초기 자세 이동 중: {self.INIT_POSE_DEG}")
-            time.sleep(3.0)
+            time.sleep(8.0)
             self.get_logger().info(f"Dobot dashboard 연결: {robot_ip}:29999")
         except KeyboardInterrupt:
             if self._dashboard is not None:
@@ -272,6 +315,8 @@ class ExecutorSupervisorNode(Node):
             stage = "approach"
         elif "pick" in prompt:
             stage = "pick"
+        elif "lift" in prompt:
+            stage = "lift"
         elif "move" in prompt:
             stage = "move"
         elif "place" in prompt:
@@ -288,11 +333,40 @@ class ExecutorSupervisorNode(Node):
                 self._gripper_on_since = None
                 self._vacuum_confirmed = False
                 self._arm_crossed_transport = False
+            # lift 진입 시 scripted lift 카운터 리셋
+            if stage == "lift":
+                self._lift_frame_count = 0
+                self._scripted_lifting = False
+                self._lift_vacuum_confirmed = False
+                self._scripted_movl_sent = False
+                self._post_lift_grip_hold = 0
 
     # ── 20Hz 실행 루프 ───────────────────────────────────────────────────────
 
     def _executor_tick(self):
         if self._emergency_stop or self._task_complete:
+            return
+
+        # 시작 자세 대기: j1..j3이 INIT_POSE 기준 home_tol_deg 이내 8프레임 연속 → 해제
+        if self._init_hold:
+            j_diff = np.abs(self._current_deg[:3] - self._init_joints_j123)
+            if j_diff.max() < self._home_tol_deg:
+                self._init_consec += 1
+                if self._init_consec >= 8:
+                    self._init_hold = False
+                    self.get_logger().info(
+                        f"[INIT_READY] 시작 자세 확인 → inference 시작 "
+                        f"j1..j3={self._current_deg[:3].tolist()} "
+                        f"diff_max={j_diff.max():.1f}°"
+                    )
+            else:
+                self._init_consec = 0
+                self.get_logger().info(
+                    f"[INIT_WAIT] 시작 자세 대기 중 "
+                    f"j1..j3={self._current_deg[:3].tolist()} "
+                    f"diff_max={j_diff.max():.1f}° (허용={self._home_tol_deg}°)",
+                    throttle_duration_sec=2.0,
+                )
             return
 
         with self._chunk_lock:
@@ -347,18 +421,25 @@ class ExecutorSupervisorNode(Node):
                 )
 
         # 그리퍼 hysteresis
-        if self._action_mode == "delta":
-            # v8: delta 누산 후 hysteresis
-            self._grip_cont = float(np.clip(self._grip_cont + (a[6] if len(a) > 6 else 0.0), 0.0, 1.0))
+        if self._action_mode == "delta" and self._gripper_mode == "delta":
+            # v13/v14: 누산 — accum이 ±0.5 threshold
+            self._grip_cont += float(a[6] if len(a) > 6 else 0.0)
             grip_raw = self._grip_cont
+            if grip_raw > 0.5:
+                hys = 1
+            elif grip_raw < -0.5:
+                hys = 0
+            else:
+                hys = self._last_gripper
         else:
+            # v6/v16/v17: action[6] 절대값 직접 threshold (0.0 or 1.0)
             grip_raw = float(a[6]) if len(a) > 6 else 0.0
-        if grip_raw >= self._grip_close:
-            hys = 1
-        elif grip_raw <= self._grip_open:
-            hys = 0
-        else:
-            hys = self._last_gripper
+            if grip_raw >= self._grip_close:
+                hys = 1
+            elif grip_raw <= self._grip_open:
+                hys = 0
+            else:
+                hys = self._last_gripper
 
         if self._grip_latch_steps > 0:
             if hys == 1:
@@ -368,6 +449,39 @@ class ExecutorSupervisorNode(Node):
                 self._grip_latch_remaining -= 1
 
         tool_on = int(hys)
+
+        # 접근 중 조기 흡착 방지: tcp_z > grip_enable_z 이면 gripper 강제 OFF
+        # 효과: 모델이 높은 Z에서 grip=1 출력해도 흡착되지 않음 → state에 gripper=0 유지
+        #       → 학습 데이터 분포(approach는 grip=0)와 일치 → 모델이 계속 하강
+        if (self._grip_enable_z > 0
+                and tool_on == 1
+                and self._tcp_z is not None
+                and self._tcp_z > self._grip_enable_z):
+            tool_on = 0
+
+        # transport 중 suction sensor=1이면 OFF 명령 차단
+        if (self._action_mode == "delta"
+                and tool_on == 0
+                and self._last_gripper == 1
+                and self._tcp_z is not None
+                and self._tcp_z > self._lift_z_done
+                and self._dashboard is not None
+                and not self._dry_run):
+            di = None
+            try:
+                res = self._dashboard.ToolDI(1)
+                if res:
+                    m = re.search(r"\{(\d+)\}", str(res))
+                    if m:
+                        di = int(m.group(1))
+            except Exception:
+                pass
+            if di == 1:
+                tool_on = 1
+                self.get_logger().info(
+                    f"[GUARD] transport 중 suction=1 → OFF 차단 (z={self._tcp_z:.1f}mm)",
+                    throttle_duration_sec=1.0,
+                )
 
         # ── transport 통과 추적 ──────────────────────────────────────────────
         if (self._vacuum_confirmed
@@ -387,21 +501,130 @@ class ExecutorSupervisorNode(Node):
                 f"[PLACE] 강제 release (z={self._tcp_z:.1f}mm ≤ {self._place_z_threshold:.1f}mm)"
             )
 
+        # lift 단계 gripper 유지: VLA grip≈0.026 → ToolDO(1,0) 방지
+        # 핵심: grip 1→0 전환이 PhaseTracker._released=True 를 세팅 → z>z_lift 후
+        #       lift lock 해제 시 "return"→"release" 전환, arm 재하강의 원인
+        if (self._current_stage == "lift"
+                and self._last_gripper == 1
+                and tool_on == 0):
+            tool_on = 1
+
+        # scripted lift 중 + 완료 후 N프레임 gripper 강제 ON (이중 보호)
+        if self._scripted_lifting or self._post_lift_grip_hold > 0:
+            tool_on = 1
+            if self._post_lift_grip_hold > 0:
+                self._post_lift_grip_hold -= 1
+
         # bad camera → MovJ 스킵 (현재 위치 유지)
         camera_hold = hasattr(self, "_frame_mean") and self._frame_mean < self._black_mean
+
+        # ── scripted lift: lift phase에서 VLA가 상승 못할 때 강제 상승 ──────
+        # 트리거: lift stage + ToolDI=1(vacuum 확인) + wait_frames 경과 + Z stall
+        # 데이터: pick Z=121.8mm → 180mm 평균 47프레임, 목표 185mm
+        use_scripted_lift = False
+        if (self._scripted_lift_enabled
+                and self._current_stage == "lift"
+                and self._dashboard is not None
+                and not self._dry_run
+                and self._tcp_z is not None
+                and not camera_hold):
+            z_now = self._tcp_z
+
+            # ToolDI(1) 로 실제 흡착 확인 (lift phase 진입 후 1회만 폴링)
+            if not self._lift_vacuum_confirmed:
+                di = None
+                try:
+                    res = self._dashboard.ToolDI(1)
+                    if res:
+                        m = re.search(r"\{(\d+)\}", str(res))
+                        if m:
+                            di = int(m.group(1))
+                except Exception:
+                    pass
+                if di == 1:
+                    self._lift_vacuum_confirmed = True
+                    self.get_logger().info(
+                        f"[SCRIPTED_LIFT] vacuum 확인 (ToolDI=1), 대기 시작 z={z_now:.1f}mm"
+                    )
+
+            # vacuum 확인됐으면 프레임 카운트
+            if self._lift_vacuum_confirmed:
+                self._lift_frame_count += 1
+
+            # stall 판정: vacuum 확인 + wait_frames 경과 + Z 낮음
+            stall = (self._lift_vacuum_confirmed
+                     and self._lift_frame_count >= self._scripted_lift_wait_frames
+                     and z_now < self._scripted_lift_stall_z)
+
+            if stall or self._scripted_lifting:
+                if not self._scripted_lifting:
+                    self._scripted_lifting = True
+                    self.get_logger().info(
+                        f"[SCRIPTED_LIFT] lift stall 감지 → 강제 상승 시작 "
+                        f"z={z_now:.1f}mm frame={self._lift_frame_count}"
+                    )
+                if z_now < self._scripted_lift_target_z:
+                    use_scripted_lift = True
+                    # 1회만 RelMovLUser 발행 (non-blocking 큐 방식)
+                    if not self._scripted_movl_sent:
+                        dz = self._scripted_lift_target_z - z_now
+                        try:
+                            self._dashboard.RelMovLUser(0, 0, dz, 0, 0, 0,
+                                                        v=self._movj_v, a=self._movj_a)
+                            self._scripted_movl_sent = True
+                            self.get_logger().info(
+                                f"[SCRIPTED_LIFT] RelMovLUser dz=+{dz:.1f}mm 발행 "
+                                f"(z={z_now:.1f}mm → {self._scripted_lift_target_z:.1f}mm)"
+                            )
+                        except Exception as exc:
+                            self.get_logger().warn(f"[SCRIPTED_LIFT] RelMovLUser 실패: {exc}")
+                else:
+                    self._scripted_lifting = False
+                    self._scripted_movl_sent = False
+                    self._lift_vacuum_confirmed = False
+                    self._post_lift_grip_hold = 32  # 2초@16Hz — transport 안정화 대기
+                    self.get_logger().info(
+                        f"[SCRIPTED_LIFT] 목표 도달 z={z_now:.1f}mm → VLA 복귀, grip hold 32f"
+                    )
 
         # 로봇 명령 전송
         if self._dashboard is not None:
             try:
-                if not camera_hold:
+                if use_scripted_lift:
+                    # RelMovLUser 실행 중: 관절 명령 완전 스킵 (VLA와 충돌 방지)
+                    self.get_logger().info(
+                        f"[SCRIPTED_LIFT] 상승 중 z={self._tcp_z:.1f}mm",
+                        throttle_duration_sec=1.0,
+                    )
+                elif not camera_hold:
                     j1, j2, j3, j4, j5, j6 = (float(x) for x in target_deg)
-                    self._dashboard.MovJ(j1, j2, j3, j4, j5, j6, 1,
-                                         v=self._movj_v, a=self._movj_a)
+                    if self._control_mode == "servoj":
+                        self._dashboard.ServoJ(
+                            j1, j2, j3, j4, j5, j6,
+                            t=self._servoj_t,
+                            aheadtime=self._servoj_aheadtime,
+                            gain=self._servoj_gain,
+                        )
+                    else:
+                        self._dashboard.MovJ(j1, j2, j3, j4, j5, j6, 1,
+                                             v=self._movj_v, a=self._movj_a)
                 self._dashboard.ToolDO(1, tool_on)
+
+                # 실행 로그: 처음 5스텝 + 이후 10스텝마다
+                if self._step_count < 5 or self._step_count % 10 == 0:
+                    stale_ms = (time.monotonic() - chunk_t) * 1000.0
+                    self.get_logger().info(
+                        f"[EXEC] step={self._step_count} mode={self._control_mode} "
+                        f"chunk_idx={idx}/{len(chunk)} stale={stale_ms:.0f}ms "
+                        f"delta=[{', '.join(f'{d:+.2f}' for d in delta)}] "
+                        f"target=[{', '.join(f'{x:.1f}' for x in target_deg)}] "
+                        f"grip={tool_on}"
+                    )
             except Exception as exc:
-                self.get_logger().warn(f"MovJ 실패: {exc}", throttle_duration_sec=2.0)
+                self.get_logger().warn(f"로봇 명령 실패 ({self._control_mode}): {exc}", throttle_duration_sec=2.0)
 
         self._last_gripper = tool_on
+        self._gripper_cmd_pub.publish(Float32(data=float(tool_on)))
 
         # ── ToolDI 흡착 확인 ────────────────────────────────────────────────
         # 위치/stage 조건 없이 gripper ON 시 센서값만으로 흡착 판정

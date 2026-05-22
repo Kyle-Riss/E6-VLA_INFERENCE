@@ -467,6 +467,9 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
 class LeRobotE6DataConfig(DataConfigFactory):
     """Data config for a custom E6 LeRobot dataset."""
 
+    # v14+: state/action에 dummy index 6 삽입/제거 (8D ↔ 7D 변환)
+    use_dummy_joint: bool = False
+
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         repack_transform = _transforms.Group(
@@ -485,8 +488,8 @@ class LeRobotE6DataConfig(DataConfigFactory):
         )
         # E6 v1 uses 6 joint deltas + 1 gripper command directly in the dataset actions.
         data_transforms = _transforms.Group(
-            inputs=[e6_policy.E6Inputs(model_type=model_config.model_type)],
-            outputs=[e6_policy.E6Outputs()],
+            inputs=[e6_policy.E6Inputs(model_type=model_config.model_type, use_dummy_joint=self.use_dummy_joint)],
+            outputs=[e6_policy.E6Outputs(use_dummy_joint=self.use_dummy_joint)],
         )
         model_transforms = ModelTransformFactory()(model_config)
 
@@ -1343,6 +1346,99 @@ _CONFIGS = [
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=30_000,
+        batch_size=1,
+        log_interval=50,
+        freeze_filter=pi0_config.freeze_filter_vlm_frozen_vision_and_action_lora(),
+        ema_decay=None,
+    ),
+    TrainConfig(
+        name="pi05_e6_v14_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m_lora_r16",
+            vision_lora_rank=16,
+            vision_lora_alpha=16.0,
+            vision_lora_layer_range=(22, 26),
+        ),
+        data=LeRobotE6DataConfig(
+            repo_id="Kyle-Riss/dobot_e6_pick_place_orange_v14",
+            use_dummy_joint=True,
+            base_config=DataConfig(
+                prompt_from_task=True,
+                action_sequence_keys=("action",),
+            ),
+            assets=AssetsConfig(
+                asset_id="Kyle-Riss/dobot_e6_pick_place_orange_v14",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=22_500,
+        batch_size=1,
+        log_interval=50,
+        freeze_filter=pi0_config.freeze_filter_vlm_frozen_vision_and_action_lora(),
+        ema_decay=None,
+    ),
+    # v16: vision LoRA 22~26 (same as v13/v14), 7D state/action, gripper absolute
+    TrainConfig(
+        name="pi05_e6_v16_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m_lora_r16",
+            vision_lora_rank=16,
+            vision_lora_alpha=16.0,
+            vision_lora_layer_range=(22, 26),
+        ),
+        data=LeRobotE6DataConfig(
+            repo_id="Kyle-Riss/dobot_e6_pick_place_orange_v16",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                action_sequence_keys=("action",),
+            ),
+            assets=AssetsConfig(
+                asset_id="Kyle-Riss/dobot_e6_pick_place_orange_v16",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=17_500,
+        batch_size=1,
+        log_interval=50,
+        freeze_filter=pi0_config.freeze_filter_vlm_frozen_vision_and_action_lora(),
+        ema_decay=None,
+    ),
+    # v17: vision LoRA 14~25 (wider range), same dataset/action contract as v16
+    TrainConfig(
+        name="pi05_e6_v17_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m_lora_r16",
+            vision_lora_rank=16,
+            vision_lora_alpha=16.0,
+            vision_lora_layer_range=(14, 25),
+        ),
+        data=LeRobotE6DataConfig(
+            repo_id="Kyle-Riss/dobot_e6_pick_place_orange_v16",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                action_sequence_keys=("action",),
+            ),
+            assets=AssetsConfig(
+                asset_id="Kyle-Riss/dobot_e6_pick_place_orange_v16",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=15_000,
         batch_size=1,
         log_interval=50,
         freeze_filter=pi0_config.freeze_filter_vlm_frozen_vision_and_action_lora(),

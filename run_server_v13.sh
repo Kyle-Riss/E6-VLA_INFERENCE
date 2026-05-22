@@ -14,7 +14,7 @@
 
 set -e
 
-DEFAULT_CKPT="/media/billy/새 볼륨2/e6_v13_22k"
+DEFAULT_CKPT="/media/billye6/새 볼륨/e6_v13_22k"
 CHECKPOINT_DIR="${1:-$DEFAULT_CKPT}"
 
 if [ ! -d "$CHECKPOINT_DIR" ]; then

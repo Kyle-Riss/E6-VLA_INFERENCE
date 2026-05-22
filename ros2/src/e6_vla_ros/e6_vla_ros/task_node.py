@@ -41,6 +41,36 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, DurabilityPolicy
 from std_msgs.msg import Float32MultiArray, Float32, String
 
+V16_PHASE_PROMPTS: dict[str, dict[str, str]] = {
+    "left": {
+        "approach":  "approach the orange box on the left side",
+        "pick_up":   "pick up the orange box on the left side",
+        "lift":      "lift the orange box",
+        "transport": "move the orange box to the right section",
+        "place":     "place the orange box in the right section",
+        "release":   "release the orange box",
+    },
+    "right": {
+        "approach":  "approach the orange box on the right side",
+        "pick_up":   "pick up the orange box on the right side",
+        "lift":      "lift the orange box",
+        "transport": "move the orange box to the left section",
+        "place":     "place the orange box in the left section",
+        "release":   "release the orange box",
+    },
+}
+
+# PhaseTracker "grasp"/"return" → v16 key 변환
+_V16_PHASE_KEY: dict[str, str] = {
+    "approach":  "approach",
+    "grasp":     "pick_up",
+    "lift":      "lift",
+    "transport": "transport",
+    "place":     "place",
+    "release":   "release",
+    "return":    "release",  # v16/v17에 return phase 없음 → release 유지
+}
+
 V8_PHASE_PROMPTS: dict[str, str] = {
     "approach":  "move the arm down to approach the orange box on the {source}",
     "grasp":     "grasp the orange box on the {source}",
@@ -58,17 +88,24 @@ class PhaseTracker:
     Z_LIFT = 180.0
     TRANSITION_FRAMES = 5
 
-    def __init__(self, z_lift: float = 180.0, transition_frames: int = 5, grip_threshold: float = 0.5):
+    def __init__(self, z_lift: float = 180.0, transition_frames: int = 5,
+                 grip_threshold: float = 0.5, grasp_z_max: float = 120.0,
+                 min_hold_frames: int = 16, pick_prearm_z: float = 0.0):
         self.z_lift = z_lift
         self.transition_frames = transition_frames
         self.grip_threshold = grip_threshold
+        self.grasp_z_max = grasp_z_max
+        self.min_hold_frames = min_hold_frames
+        self.pick_prearm_z = pick_prearm_z
 
         self._phase = "approach"
         self._prev_gripper = 0
-        self._crossed_lift = False  # gripper=1 상태에서 z>z_lift 통과 여부
-        self._released = False      # 이 에피소드에서 gripper 1→0 전환 발생 여부
-        self._trans_counter = 0     # gripper 전환 후 남은 window 프레임 수
-        self._trans_type: str | None = None  # "close" | "open"
+        self._crossed_lift = False
+        self._released = False
+        self._trans_counter = 0
+        self._trans_type: str | None = None
+        self._high_z_grip = False
+        self._hold_counter = 0      # 현재 phase 최소 유지 잔여 프레임
 
     def reset(self):
         self._phase = "approach"
@@ -77,30 +114,45 @@ class PhaseTracker:
         self._released = False
         self._trans_counter = 0
         self._trans_type = None
+        self._high_z_grip = False
+        self._hold_counter = 0
 
     def update(self, gripper_raw: float, tcp_z: float) -> str:
         gripper = 1 if gripper_raw >= self.grip_threshold else 0
+        valid_grasp_z = tcp_z <= self.grasp_z_max
 
         # gripper 전환 감지
         if gripper != self._prev_gripper:
-            self._trans_counter = self.transition_frames
-            self._trans_type = "close" if gripper == 1 else "open"
-            if gripper == 0:
-                self._released = True
+            if gripper == 1 and not valid_grasp_z:
+                # 높은 Z에서 grip spike → 무시 (접근 중 오발동)
+                self._high_z_grip = True
+            elif gripper == 0 and self._high_z_grip:
+                # 높은 Z spike 해제 → 전환 무시, approach 유지
+                self._high_z_grip = False
+            else:
+                self._high_z_grip = False
+                self._trans_counter = self.transition_frames
+                self._trans_type = "close" if gripper == 1 else "open"
+                if gripper == 0:
+                    self._released = True
 
         # crossed_lift 플래그 갱신
         if gripper == 1 and tcp_z > self.z_lift:
             self._crossed_lift = True
         if gripper == 0:
-            self._crossed_lift = False  # 다음 pick cycle을 위해 리셋
+            self._crossed_lift = False
 
         # phase 결정 (우선순위 순)
-        if self._trans_counter > 0 and self._trans_type == "close":
+        if self._high_z_grip:
+            phase = "approach"
+        elif self._trans_counter > 0 and self._trans_type == "close":
             phase = "grasp"
         elif self._trans_counter > 0 and self._trans_type == "open":
             phase = "release"
         elif gripper == 0 and self._released:
             phase = "return"
+        elif gripper == 0 and self.pick_prearm_z > 0 and tcp_z <= self.pick_prearm_z:
+            phase = "grasp"  # Z 기반 미리 pick_up (학습 레이블 타이밍 맞춤)
         elif gripper == 0:
             phase = "approach"
         elif gripper == 1 and tcp_z > self.z_lift:
@@ -110,8 +162,26 @@ class PhaseTracker:
         else:
             phase = "lift"
 
+        # lift lock: tcp_z > z_lift 가 돼야만 "lift" 탈출 (brief grip drop/spike 무시)
+        # 효과: z=85mm에서 잡고 들어올리는 동안 grip 노이즈로 release→pick_up 사이클 방지
+        if self._phase == "lift" and tcp_z <= self.z_lift:
+            if phase not in ("lift", "transport"):
+                if not hasattr(self, "_lift_lock_logged"):
+                    self._lift_lock_logged = True
+                self._lift_lock_count = getattr(self, "_lift_lock_count", 0) + 1
+                phase = "lift"
+
+        # min_hold_frames: phase 전환 시 최소 N 프레임 유지 (빠른 사이클 방지)
+        if phase != self._phase:
+            if self._hold_counter > 0:
+                phase = self._phase  # 아직 전환 불가
+            else:
+                self._hold_counter = self.min_hold_frames
+
         if self._trans_counter > 0:
             self._trans_counter -= 1
+        if self._hold_counter > 0:
+            self._hold_counter -= 1
 
         self._prev_gripper = gripper
         self._phase = phase
@@ -122,16 +192,43 @@ class PhaseTracker:
         return self._phase
 
 
+V14_PROMPTS: dict[str, str] = {
+    "left":  "pick up the orange box from the left side and place it on the right side",
+    "right": "pick up the orange box from the right side and place it on the left side",
+}
+
 V13_PROMPTS: dict[str, list[str]] = {
     "left": [
-        "pick up the orange box from the left side and place it on the right side",
         "move the orange box from the left to the right",
+        "pick up the orange box from the left side and place it on the right side",
         "grasp the orange box on the left and put it down on the right",
     ],
     "right": [
-        "pick up the orange box from the right side and place it on the left side",
         "move the orange box from the right to the left",
+        "pick up the orange box from the right side and place it on the left side",
         "grasp the orange box on the right and put it down on the left",
+    ],
+    # can generalization test (vision frozen → language grounding)
+    "can_left": [
+        "pick up the can from the left side and place it on the right side",
+        "grasp the can on the left and put it down on the right",
+        "move the can from the left to the right",
+    ],
+    "can_right": [
+        "pick up the can from the right side and place it on the left side",
+        "grasp the can on the right and put it down on the left",
+        "move the can from the right to the left",
+    ],
+    # egg generalization test
+    "egg_left": [
+        "pick up the egg from the left side and place it on the right side",
+        "grasp the egg on the left and put it down on the right",
+        "move the egg from the left to the right",
+    ],
+    "egg_right": [
+        "pick up the egg from the right side and place it on the left side",
+        "grasp the egg on the right and put it down on the left",
+        "move the egg from the right to the left",
     ],
 }
 
@@ -171,12 +268,17 @@ class TaskNode(Node):
         # per_frame 모드 전용 파라미터
         self.declare_parameter("z_lift", 180.0)
         self.declare_parameter("grip_threshold", 0.5)
+        self.declare_parameter("grasp_z_max", 120.0)   # grasp 진입 허용 최대 TCP Z (mm)
+        self.declare_parameter("min_hold_frames", 16)  # phase 최소 유지 프레임 (빠른 사이클 방지)
+        self.declare_parameter("pick_prearm_z", 0.0)   # Z 기반 pick_up 선진입 임계값 (mm), 0=비활성
         self.declare_parameter("phase_hz", 16.0)
         self.declare_parameter("return_z_done", 180.0)
         self.declare_parameter("return_done_steps", 5)
 
         # single 모드 전용
-        self.declare_parameter("prompt_variant", -1)  # 0~2 고정 선택, -1이면 랜덤
+        self.declare_parameter("prompt_variant", -1)   # 0~2 고정 선택, -1이면 랜덤
+        self.declare_parameter("prompt_text", "")      # 직접 입력 시 이 값 우선
+        self.declare_parameter("prompt_dataset", "v13")  # "v13" (6 variant) | "v14" (anchor 2개)
 
         self._prompt_mode = self.get_parameter("prompt_mode").value
         seq_str = self.get_parameter("task_sequence").value
@@ -206,6 +308,9 @@ class TaskNode(Node):
                 z_lift=self.get_parameter("z_lift").value,
                 transition_frames=5,
                 grip_threshold=self.get_parameter("grip_threshold").value,
+                grasp_z_max=self.get_parameter("grasp_z_max").value,
+                min_hold_frames=self.get_parameter("min_hold_frames").value,
+                pick_prearm_z=self.get_parameter("pick_prearm_z").value,
             )
             self._latest_gripper: float = 0.0
             self._latest_tcp_z: float = 200.0
@@ -224,22 +329,64 @@ class TaskNode(Node):
                 f"phase_hz={phase_hz}"
             )
 
+        elif self._prompt_mode == "per_frame_v16":
+            self._source_side = self.get_parameter("source_side").value
+            self._target_side = self.get_parameter("target_side").value
+
+            self._phase_tracker = PhaseTracker(
+                z_lift=self.get_parameter("z_lift").value,
+                transition_frames=5,
+                grip_threshold=self.get_parameter("grip_threshold").value,
+                grasp_z_max=self.get_parameter("grasp_z_max").value,
+                min_hold_frames=self.get_parameter("min_hold_frames").value,
+                pick_prearm_z=self.get_parameter("pick_prearm_z").value,
+            )
+            self._latest_gripper: float = 0.0
+            self._latest_tcp_z: float = 200.0
+
+            self.create_subscription(Float32MultiArray, "/e6/robot/state", self._cb_state, 10)
+            self.create_subscription(Float32, "/e6/robot/tcp_z", self._cb_tcpz, 10)
+
+            phase_hz = self.get_parameter("phase_hz").value
+            self.create_timer(1.0 / phase_hz, self._phase_tick_v16)
+
+            self.get_logger().info(
+                f"task_node 시작 (per_frame_v16) — "
+                f"source={self.get_parameter('source_side').value} "
+                f"z_lift={self.get_parameter('z_lift').value}mm "
+                f"phase_hz={phase_hz}"
+            )
+
         elif self._prompt_mode == "single":
-            source = self.get_parameter("source_side").value
-            variants = V13_PROMPTS.get(source)
-            if variants is None:
-                self.get_logger().error(
-                    f"source_side='{source}' 는 'left' 또는 'right' 여야 합니다."
-                )
-                raise ValueError(f"invalid source_side: {source!r}")
-            variant_idx = self.get_parameter("prompt_variant").value
-            if variant_idx < 0 or variant_idx >= len(variants):
-                chosen = random.choice(variants)
+            custom = self.get_parameter("prompt_text").value.strip()
+            if custom:
+                chosen = custom
             else:
-                chosen = variants[variant_idx]
+                source = self.get_parameter("source_side").value
+                dataset = self.get_parameter("prompt_dataset").value
+                if dataset == "v14":
+                    anchor = V14_PROMPTS.get(source)
+                    if anchor is None:
+                        self.get_logger().error(
+                            f"source_side='{source}' 는 V14_PROMPTS에 없는 키입니다."
+                        )
+                        raise ValueError(f"invalid source_side: {source!r}")
+                    chosen = anchor
+                else:
+                    variants = V13_PROMPTS.get(source)
+                    if variants is None:
+                        self.get_logger().error(
+                            f"source_side='{source}' 는 V13_PROMPTS에 없는 키입니다."
+                        )
+                        raise ValueError(f"invalid source_side: {source!r}")
+                    variant_idx = self.get_parameter("prompt_variant").value
+                    if variant_idx < 0 or variant_idx >= len(variants):
+                        chosen = random.choice(variants)
+                    else:
+                        chosen = variants[variant_idx]
             self._prompt_pub.publish(String(data=chosen))
             self.get_logger().info(
-                f"task_node 시작 (single) — source={source} prompt={chosen!r}"
+                f"task_node 시작 (single) — dataset={self.get_parameter('prompt_dataset').value} prompt={chosen!r}"
             )
 
         else:
@@ -289,6 +436,32 @@ class TaskNode(Node):
         )
         self._prompt_pub.publish(String(data=prompt))
 
+    # task_id 매핑 (tasks.jsonl 순서와 일치)
+    _V16_TASK_ID: dict[str, dict[str, int]] = {
+        "left":  {"approach": 0, "pick_up": 1, "lift": 2, "transport": 3, "place": 4, "release": 5},
+        "right": {"approach": 6, "pick_up": 7, "lift": 2, "transport": 8, "place": 9, "release": 5},
+    }
+
+    def _phase_tick_v16(self):
+        if self._done:
+            return
+        phase = self._phase_tracker.update(self._latest_gripper, self._latest_tcp_z)
+        key = _V16_PHASE_KEY.get(phase, "release")
+        prompt = V16_PHASE_PROMPTS[self._source_side][key]
+        task_id = self._V16_TASK_ID.get(self._source_side, {}).get(key, -1)
+
+        if not hasattr(self, "_last_v16_key") or self._last_v16_key != key:
+            lock_cnt = getattr(self, "_lift_lock_count", 0)
+            self.get_logger().info(
+                f"[phase_v16] {getattr(self, '_last_v16_key', '?')} → {key} "
+                f"(task_id={task_id}) grip={self._latest_gripper:.2f} z={self._latest_tcp_z:.1f}mm"
+                + (f" [lift_lock held {lock_cnt}f]" if lock_cnt > 0 else "")
+            )
+            self._last_v16_key = key
+            self._lift_lock_count = 0  # 전환 시 카운터 리셋
+
+        self._prompt_pub.publish(String(data=prompt))
+
     # ── supervisor status 콜백 ────────────────────────────────────────────────
 
     def _cb_status(self, msg: String):
@@ -300,7 +473,7 @@ class TaskNode(Node):
             self.get_logger().info(f"supervisor STAGE_DONE 수신: {status}")
             self._advance_stage()
 
-        elif status == "TASK_COMPLETE" and self._prompt_mode == "single":
+        elif status == "TASK_COMPLETE" and self._prompt_mode in ("single", "per_frame_v16"):
             # single 모드: executor가 B+C 종료를 감지 → /e6/supervisor/status 로 발행
             # → 여기서 /e6/task/status 로 중계 (MCAP 기록 + executor 수신 용)
             self.get_logger().info("=" * 60)

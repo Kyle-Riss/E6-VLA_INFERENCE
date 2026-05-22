@@ -86,5 +86,8 @@ class WebsocketPolicyServer:
 def _health_check(connection: _server.ServerConnection, request: _server.Request) -> _server.Response | None:
     if request.path == "/healthz":
         return connection.respond(http.HTTPStatus.OK, "OK\n")
-    # Continue with the normal request handling.
+    upgrade = request.headers.get("Upgrade", "").lower()
+    connection_vals = [v.strip().lower() for v in request.headers.get("Connection", "").split(",")]
+    if upgrade != "websocket" or "upgrade" not in connection_vals:
+        return connection.respond(http.HTTPStatus.UPGRADE_REQUIRED, "WebSocket upgrade required\n")
     return None

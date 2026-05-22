@@ -88,6 +88,11 @@ class CameraStateNode(Node):
             self._init_camera()
             self._init_zed()
 
+        # executor_supervisor_node가 발행하는 명령 그리퍼 상태 구독
+        # DigitalOutputs 비트 마스크 대신 명령 상태를 신뢰할 수 있는 출처로 사용
+        self.create_subscription(Float32, "/e6/gripper/commanded",
+                                 lambda msg: setattr(self, "_last_gripper", msg.data), 10)
+
         # 18Hz 타이머
         self.create_timer(1/18, self._tick)
         self.get_logger().info(
@@ -219,9 +224,8 @@ class CameraStateNode(Node):
                 tv = np.asarray(fb["ToolVectorActual"][0], dtype=np.float32)
                 tcp_z = float(tv[2])
 
-                # DigitalOutputs bit 0 = ToolDO(1) 그리퍼
-                do = int(fb["DigitalOutputs"][0])
-                self._last_gripper = float((do >> 0) & 1)
+                # 그리퍼 상태는 /e6/gripper/commanded 구독으로 갱신
+                # (DigitalOutputs의 ToolDO 비트 매핑이 불명확하여 명령 상태 사용)
         except Exception as exc:
             self.get_logger().warn(f"feedBackData 실패: {exc}", throttle_duration_sec=5.0)
 
