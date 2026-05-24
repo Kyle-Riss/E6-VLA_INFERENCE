@@ -16,6 +16,7 @@ setup(
             'inference_bridge_node    = e6_vla_ros.inference_bridge_node:main',
             'executor_supervisor_node = e6_vla_ros.executor_supervisor_node:main',
             'task_node                = e6_vla_ros.task_node:main',
+            'voice_command_node       = e6_vla_ros.voice_command_node:main',
         ],
     },
 )

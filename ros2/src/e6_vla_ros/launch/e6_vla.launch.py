@@ -73,6 +73,15 @@ def generate_launch_description():
         DeclareLaunchArgument("scripted_lift_stall_z",       default_value="160.0"),  # 이 Z 미달 시 stall
         DeclareLaunchArgument("scripted_lift_dz_thresh",     default_value="0.3"),    # mm/frame 이하 시 stall
 
+        # ── 음성 명령 인자 ─────────────────────────────────────────────────────
+        DeclareLaunchArgument("use_voice",              default_value="false"),   # voice_command_node 활성화
+        DeclareLaunchArgument("use_mic",                default_value="true"),    # 마이크 캡처 활성화 (false=텍스트 전용)
+        DeclareLaunchArgument("voice_model_size",       default_value="base"),    # tiny/base/small/medium
+        DeclareLaunchArgument("voice_language",         default_value="ko"),      # STT 언어
+        DeclareLaunchArgument("voice_device_index",     default_value="-1"),      # 마이크 장치 인덱스
+        DeclareLaunchArgument("voice_vad_amplitude",    default_value="0.02"),    # 음성 감지 최소 진폭
+        DeclareLaunchArgument("voice_silence_sec",      default_value="1.5"),     # 발화 종료 판정 침묵 시간
+
         # ── 노드 1: camera_state_node ──────────────────────────────────────
         Node(
             package="e6_vla_ros",
@@ -202,6 +211,23 @@ def generate_launch_description():
                 "asset_uri_allowlist": ["^package://(?!\\.)[^./][^/]*/.*"],
             }],
             condition=IfCondition(LaunchConfiguration("foxglove")),
+        ),
+
+        # ── 노드 8: voice_command_node (use_voice:=true 일 때만 실행) ────────
+        Node(
+            package="e6_vla_ros",
+            executable="voice_command_node",
+            name="voice_command_node",
+            output="screen",
+            parameters=[{
+                "use_mic":              LaunchConfiguration("use_mic"),
+                "model_size":           LaunchConfiguration("voice_model_size"),
+                "language":             LaunchConfiguration("voice_language"),
+                "device_index":         LaunchConfiguration("voice_device_index"),
+                "vad_min_amplitude":    LaunchConfiguration("voice_vad_amplitude"),
+                "silence_duration_sec": LaunchConfiguration("voice_silence_sec"),
+            }],
+            condition=IfCondition(LaunchConfiguration("use_voice")),
         ),
 
         # ── MCAP 레코더 (record_mcap:=true 일 때만 실행) ───────────────────

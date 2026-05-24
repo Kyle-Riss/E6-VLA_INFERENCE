@@ -223,6 +223,7 @@ class ExecutorSupervisorNode(Node):
         self.create_subscription(Float32,           "/e6/robot/tcp_z",          self._cb_tcpz,        10)
         self.create_subscription(String,            "/e6/task/prompt",          self._cb_prompt,      10)
         self.create_subscription(String,            "/e6/task/status",          self._cb_task_status, 10)
+        self.create_subscription(String,            "/e6/supervisor/voice_override", self._cb_voice_override, 10)
 
         # 발행
         self._status_pub      = self.create_publisher(String, "/e6/supervisor/status",    10)
@@ -757,6 +758,16 @@ class ExecutorSupervisorNode(Node):
         self._status_pub.publish(String(data=status))
 
     # ── 긴급 정지 서비스 ─────────────────────────────────────────────────────
+
+    def _cb_voice_override(self, msg: String):
+        if msg.data.strip().upper() == "STOP":
+            self._emergency_stop = True
+            self.get_logger().error("[VOICE] 음성 STOP 명령 수신 → 긴급 정지")
+            if self._dashboard is not None:
+                try:
+                    self._dashboard.EmergencyStop(0)
+                except Exception:
+                    pass
 
     def _cb_estop(self, request, response):
         self._emergency_stop = True

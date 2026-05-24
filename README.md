@@ -6,20 +6,63 @@ Dobot E6 로봇 팔을 위한 π0.5 VLA(Vision-Language-Action) 추론 파이프
 ## 아키텍처
 
 ```
-[serve_policy.py]  ←── WebSocket ──→  [inference_bridge_node]
-  정책 서버 (π0.5 추론)                [camera_state_node]      ──→  Dobot E6
-                                       [executor_supervisor_node]    192.168.5.1
-                                       [task_node]
+                        ┌──────────────────────────────────────────┐
+                        │          입력 레이어                       │
+  [HIK 카메라]  [ZED 카메라]  [Dobot E6]          [마이크 / 텍스트]  │
+       └──────────────────────┘    │                    │           │
+                  │                │                    │           │
+                  ▼                │                    ▼           │
+       [camera_state_node]◄────────┘      [voice_command_node] ★   │
+            18Hz                                 STT + 명령 분류    │
+         │  │  │                                   │        │       │
+  image  │  │  │ state/tcp_z          voice_command│        │STOP   │
+  zed    │  │  │                                   ▼        ▼       │
+         │  │  └──────────────────►  [task_node] ◄────  [executor]  │
+         │  │                           PhaseTracker       │        │
+         │  └──────────────────────►  /e6/task/prompt      │        │
+         │                                │                │        │
+         └──────────────────►  [inference_bridge_node]     │        │
+                                    obs 조립                │        │
+                                    WebSocket 추론           │        │
+                                          │                 │        │
+                               [Policy Server (π0 + LoRA)]  │        │
+                                    action_chunk (16×7)     │        │
+                                          │                 │        │
+                                          └────────────────►│        │
+                                                    MovJ/ServoJ      │
+                                                    ToolDO           │
+                                                    → Dobot E6       │
+                        └──────────────────────────────────────────┘
 ```
 
-ROS2 노드 4개로 구성:
+### ROS2 노드
 
 | 노드 | 역할 |
 |------|------|
-| `camera_state_node` | HIK(top) + ZED(scene) 카메라 → `/e6/camera/image`, `/e6/camera/zed_image` |
+| `camera_state_node` | HIK(top) + ZED(scene) 카메라 → `/e6/camera/image`, `/e6/camera/zed_image`, `/e6/robot/state` |
 | `inference_bridge_node` | obs 조립 → WebSocket 정책 서버 → `/e6/policy/action_chunk` |
-| `executor_supervisor_node` | action_chunk 수신 → MovJ/ToolDO 실행 + 종료 조건 감시 |
-| `task_node` | 프롬프트 발행, TASK_COMPLETE 중계 |
+| `executor_supervisor_node` | action_chunk 수신 → MovJ/ServoJ/ToolDO 실행 + 안전 감시 |
+| `task_node` | PhaseTracker 기반 per-frame 프롬프트 발행 + TASK_COMPLETE 중계 |
+| `voice_command_node` ★ | 음성/텍스트 → prompt 변환 → task_node·executor로 전달 |
+
+### 토픽 목록
+
+| 토픽 | 타입 | 발행 | 구독 |
+|------|------|------|------|
+| `/e6/camera/image` | Image | camera_state | inference_bridge, executor |
+| `/e6/camera/zed_image` | Image | camera_state | inference_bridge |
+| `/e6/robot/state` | Float32MultiArray | camera_state | inference_bridge, executor, task |
+| `/e6/robot/tcp_z` | Float32 | camera_state | executor, task |
+| `/e6/gripper/commanded` | Float32 | executor | camera_state |
+| `/e6/task/prompt` | String | task | inference_bridge, executor |
+| `/e6/task/status` | String | task | inference_bridge, executor |
+| `/e6/supervisor/status` | String | executor | task |
+| `/e6/policy/action_chunk` | Float32MultiArray | inference_bridge | executor |
+| `/e6/task/voice_command` ★ | String | voice_command | task |
+| `/e6/supervisor/voice_override` ★ | String | voice_command | executor |
+| `/e6/voice/text_input` ★ | String | (외부 CLI) | voice_command |
+
+---
 
 ## 요구 환경
 
@@ -30,13 +73,15 @@ ROS2 노드 4개로 구성:
 - Dobot E6 (TCP/IP, 192.168.5.1)
 - 가상환경: `~/move-one/min-imum/move-one/bin/activate`
 
-## 빠른 시작 (v13)
+---
+
+## 빠른 시작 (v17 — 현재 권장)
 
 ### 터미널 1 — 정책 서버
 
 ```bash
 cd ~/E6-VLA_INFERENCE
-bash run_server_v13.sh /media/billy/새\ 볼륨2/e6_v13_22k
+bash run_server_v17.sh /media/billye6/새\ 볼륨/e6_checkpoints/e6_v17_15000
 ```
 
 ### 터미널 2 — ROS2 추론
@@ -44,39 +89,98 @@ bash run_server_v13.sh /media/billy/새\ 볼륨2/e6_v13_22k
 ```bash
 cd ~/E6-VLA_INFERENCE/ros2
 source install/setup.bash
-
-ros2 launch e6_vla_ros e6_vla.launch.py \
-  prompt_mode:=single \
-  source_side:=left \
-  action_mode:=delta \
-  max_delta_deg:=5.0
+ros2 launch e6_vla_ros e6_vla.launch.py
 ```
 
-### 주요 launch 인자
+> v17 기본값이 모두 설정되어 있어 인자 없이 실행 가능  
+> (action_mode=delta, gripper_mode=absolute, prompt_mode=per_frame_v16)
+
+---
+
+## 음성 명령 사용법 ★
+
+### 마이크 사용 (STT 포함)
+
+```bash
+# 의존 패키지 설치 (최초 1회)
+pip3 install faster-whisper sounddevice
+
+# 마이크 활성화 launch
+ros2 launch e6_vla_ros e6_vla.launch.py use_voice:=true
+```
+
+말할 수 있는 명령 예시:
+
+| 발화 | 변환되는 prompt |
+|------|----------------|
+| "왼쪽 박스 집어줘" | `pick up the orange box from the left side and place it on the right side` |
+| "오른쪽 박스 집어줘" | `pick up the orange box from the right side and place it on the left side` |
+| "집어줘" | `pick up the orange box` |
+| "멈춰" / "정지" / "그만" / "stop" | → executor 즉시 긴급 정지 |
+
+### 마이크 없이 텍스트로만 사용
+
+```bash
+# 마이크 없이 노드 실행 (텍스트 입력 전용)
+ros2 launch e6_vla_ros e6_vla.launch.py use_voice:=true use_mic:=false
+
+# 별도 터미널에서 텍스트 명령 주입
+ros2 topic pub --once /e6/voice/text_input std_msgs/msg/String \
+  "data: '왼쪽 박스 집어줘'"
+
+# 영어 prompt 직접 주입
+ros2 topic pub --once /e6/voice/text_input std_msgs/msg/String \
+  "data: 'pick up the orange box from the left side'"
+
+# STOP 명령
+ros2 topic pub --once /e6/voice/text_input std_msgs/msg/String \
+  "data: '멈춰'"
+```
+
+### voice_command_node 파라미터
+
+| 파라미터 | 기본값 | 설명 |
+|----------|--------|------|
+| `use_mic` | `true` | 마이크 캡처 활성화 |
+| `model_size` | `base` | Whisper 모델 크기 (tiny/base/small/medium) |
+| `language` | `ko` | STT 언어 |
+| `vad_min_amplitude` | `0.02` | 음성 감지 최소 RMS 진폭 |
+| `silence_duration_sec` | `1.5` | 발화 종료 판정 침묵 시간 (초) |
+| `device_index` | `-1` | 마이크 장치 인덱스 (-1=시스템 기본값) |
+
+---
+
+## 주요 launch 인자
 
 | 인자 | 기본값 | 설명 |
 |------|--------|------|
-| `action_mode` | `delta` | `delta` / `absolute` |
-| `prompt_mode` | `single` | `single` (v13) / `per_frame` (v8~v12) |
-| `source_side` | `left` | 오렌지 박스 시작 위치 (`left` / `right`) |
-| `prompt_variant` | `-1` | 0~2 고정 선택, -1이면 랜덤 |
-| `max_delta_deg` | `5.0` | delta 클램핑 상한 (degree) |
-| `max_steps` | `500` | 강제 종료 스텝 수 (안전망) |
-| `min_steps` | `100` | 정상 종료 감지 시작 스텝 |
-| `home_tol_deg` | `5.0` | 초기 자세 복귀 허용 오차 (degree) |
-| `home_consec_req` | `16` | 복귀 판정 연속 프레임 수 |
-| `record_mcap` | `false` | MCAP 기록 켜기 |
-| `foxglove` | `false` | Foxglove Bridge 실시간 스트리밍 |
-| `task_sequence` | `approach` | 실행할 stage (쉼표 구분) |
+| `action_mode` | `delta` | `delta` (v8+) / `absolute` (v6) |
+| `gripper_mode` | `absolute` | `absolute` (v16/v17) / `delta` (v13/v14) |
+| `prompt_mode` | `per_frame_v16` | `per_frame_v16` / `single` (v13) / `per_frame` (v8) |
+| `source_side` | `left` | 오렌지 박스 시작 위치 |
+| `max_delta_deg` | `3.0` | delta 클램핑 상한 (degree) |
+| `max_steps` | `3000` | 강제 종료 스텝 수 (안전망) |
+| `min_tool_z` | `75.0` | 최소 TCP Z (mm) — 이하 시 FAIL_SAFETY |
+| `grip_enable_z` | `125.0` | 이 Z 이하에서만 흡착 허용 (조기 흡착 방지) |
+| `grasp_z_max` | `130.0` | grasp phase 진입 최대 Z (mm) |
+| `scripted_lift_enabled` | `true` | lift stall 시 RelMovLUser 강제 상승 |
+| `place_force_release_enabled` | `true` | place Z ≤ 110mm 시 강제 release |
+| `control_mode` | `movj` | `movj` / `servoj` (실시간 갱신) |
+| `use_voice` | `false` | voice_command_node 활성화 ★ |
+| `use_mic` | `true` | 마이크 캡처 (false=텍스트 전용) ★ |
+| `record_mcap` | `false` | MCAP 기록 |
+| `foxglove` | `true` | Foxglove Bridge 실시간 스트리밍 |
 
-## 관측 / 액션 계약
+---
+
+## 관측 / 액션 계약 (v16/v17)
 
 ### 관측 (obs)
 
 | 키 | Shape | 설명 |
 |----|-------|------|
-| `observation/exterior_image_1_left` | (224, 224, 3) uint8 | HIK 탑뷰 카메라 RGB |
-| `observation/exterior_image_2_left` | (224, 224, 3) uint8 | ZED 씬 카메라 RGB |
+| `observation/exterior_image_1_left` | (224, 224, 3) uint8 | HIK 탑뷰 |
+| `observation/exterior_image_2_left` | (224, 224, 3) uint8 | ZED 씬 |
 | `observation/state` | (7,) float32 | [j1..j6 deg, gripper 0~1] |
 | `prompt` | str | 태스크 지시 문구 |
 
@@ -87,58 +191,56 @@ ros2 launch e6_vla_ros e6_vla.launch.py \
 | HIK | 640×480 → 320×240 → crop[16:240, 55:279] → **224×224** |
 | ZED | HD1080 → 640×480 → crop[120:480, 150:510] → 360×360 → **224×224** |
 
-### 액션 (v8 이후)
+### 액션 (v16/v17)
 
 | 인덱스 | 의미 |
 |--------|------|
 | `[:, 0:6]` | 관절 velocity delta (deg/frame) |
-| `[:, 6]` | 그리퍼 delta (누산: `clip(grip_cont + Δ, 0, 1)`) |
+| `[:, 6]` | 그리퍼 absolute (0.0 or 1.0, threshold 0.5) |
 
 - action_horizon: **16** / 실행: 앞 8개 / 제어 주기: **16Hz**
 - state 입력: 7D 절대값 [j1..j6 deg, gripper]
 
-## 종료 조건 (v13)
-
-| 조건 | 설명 |
-|------|------|
-| **B (안전망)** | `step_count > max_steps(500)` → 강제 종료 |
-| **C (정상)** | `step_count > min_steps(100)` 이후 j1~j3이 INIT_POSE `[91.3, 37.7, 53.8]°` ±5° 이내 16프레임 연속 |
+---
 
 ## 지원 모델
 
-| Config | 데이터셋 | Action | Prompt | 체크포인트 |
-|--------|---------|--------|--------|-----------|
-| `pi05_e6_v8_lora` | v8 | delta | per_frame | `pytorch_from_jax_v8_lora_merged` |
-| `pi05_e6_v9_lora` | v8 | delta | per_frame | `pytorch_from_jax_v9_lora_merged` |
-| `pi05_e6_v10_lora` | v10 | delta | per_frame | `e6_checkpoints/e6_v10_50k` |
-| `pi05_e6_v11_lora` | v10 | delta | per_frame | `e6_checkpoints/e6_v11_30k` |
-| `pi05_e6_v12_lora` | v10 | delta | per_frame | `e6_checkpoints/e6_v12_30k` |
-| `pi05_e6_v13_lora` | v13 | delta | single | `e6_v13_22k` |
+| Config | Action | Gripper | Prompt | 체크포인트 |
+|--------|--------|---------|--------|-----------|
+| `pi05_e6_v8_lora` | delta | delta 누산 | per_frame | `pytorch_from_jax_v8_lora_merged` |
+| `pi05_e6_v13_lora` | delta | delta 누산 | single | `e6_checkpoints/e6_v13_30k` |
+| `pi05_e6_v16_lora` | delta | absolute | per_frame_v16 | `e6_checkpoints/e6_v16_*` |
+| `pi05_e6_v17_lora` | delta | absolute | per_frame_v16 | `e6_checkpoints/e6_v17_15000` |
+| `pi05_e6_v18_lora` | delta | absolute | per_frame_v16 | `e6_checkpoints/e6_v18_20k` |
+| `pi05_e6_v19_lora` | delta | absolute | per_frame_v16 | `e6_checkpoints/e6_v19_20k` |
 
-> 체크포인트 기본 경로: `/media/billy/새 볼륨2/` (v13) / `/media/billye6/새 볼륨/e6_checkpoints/` (v8~v12)
+> 체크포인트 기본 경로: `/media/billye6/새 볼륨/e6_checkpoints/`
+
+---
 
 ## 파일 구조
 
 ```
 E6-VLA_INFERENCE/
-├── run_server_v8.sh ~ run_server_v13.sh   # 버전별 정책 서버 실행 스크립트
+├── run_server_v17.sh ~ run_server_v19.sh  # 버전별 정책 서버 실행 스크립트
 ├── scripts/
 │   ├── serve_policy.py                    # 정책 서버 (WebSocket)
 │   ├── test_train_image_infer.py          # 학습 이미지 기반 추론 테스트
 │   └── test_grounding.py                  # 카메라/state grounding 검증
-├── examples/e6/
-│   └── run_e6_client.py                   # 단일 스크립트 모드 클라이언트
 ├── ros2/src/e6_vla_ros/e6_vla_ros/
 │   ├── camera_state_node.py               # HIK + ZED 카메라 퍼블리셔
 │   ├── inference_bridge_node.py           # obs 조립 + WebSocket 추론
-│   ├── executor_supervisor_node.py        # MovJ/ToolDO + 종료 감시
-│   └── task_node.py                       # 프롬프트 발행 + TASK_COMPLETE 중계
+│   ├── executor_supervisor_node.py        # MovJ/ServoJ/ToolDO + 안전 감시
+│   ├── task_node.py                       # PhaseTracker + 프롬프트 발행
+│   └── voice_command_node.py             # 음성/텍스트 → prompt 변환 ★
 ├── ros2/src/e6_vla_ros/launch/
 │   └── e6_vla.launch.py                   # 전체 런치 파일
 └── src/openpi/
     ├── models/                            # 모델 아키텍처
     └── training/config.py                 # 버전별 TrainConfig 정의
 ```
+
+---
 
 ## Jetson 환경 주의사항
 

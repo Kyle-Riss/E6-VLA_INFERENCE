@@ -298,6 +298,9 @@ class TaskNode(Node):
         # supervisor status 구독 (episode 모드에서만 stage 전환에 사용)
         self.create_subscription(String, "/e6/supervisor/status", self._cb_status, 10)
 
+        # 음성 명령 구독 — voice_command_node가 변환한 prompt를 즉시 반영
+        self.create_subscription(String, "/e6/task/voice_command", self._cb_voice_command, 10)
+
         if self._prompt_mode == "per_frame":
             self._source_side = self.get_parameter("source_side").value
             self._target_side = self.get_parameter("target_side").value
@@ -398,6 +401,24 @@ class TaskNode(Node):
                 f"task_node 시작 (episode) — sequence={self._seq} "
                 f"timeout={self._timeout}s loop={self._loop}"
             )
+
+    # ── 음성 명령 콜백 ───────────────────────────────────────────────────────
+
+    def _cb_voice_command(self, msg: String):
+        prompt = msg.data.strip()
+        if not prompt:
+            return
+        self.get_logger().info(f"[VOICE] 음성 명령 수신 → prompt 즉시 발행: '{prompt}'")
+        self._prompt_pub.publish(String(data=prompt))
+
+        # per_frame_v16 모드: source_side도 갱신해 이후 PhaseTracker 프롬프트 방향 반영
+        if self._prompt_mode == "per_frame_v16":
+            if "left side" in prompt and "from the left" in prompt:
+                self._source_side = "left"
+                self._target_side = "right"
+            elif "right side" in prompt and "from the right" in prompt:
+                self._source_side = "right"
+                self._target_side = "left"
 
     # ── 구독 콜백 (per_frame 모드) ────────────────────────────────────────────
 
