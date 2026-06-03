@@ -29,7 +29,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, DurabilityPolicy
 from sensor_msgs.msg import Image
-from std_msgs.msg import Float32MultiArray, String
+from std_msgs.msg import Float32MultiArray, String, Int32
 
 # ── openpi_client 경로 ───────────────────────────────────────────────────────
 _REPO = Path(__file__).resolve().parents[4]
@@ -93,6 +93,8 @@ class InferenceBridgeNode(Node):
 
         # 발행
         self._chunk_pub = self.create_publisher(Float32MultiArray, "/e6/policy/action_chunk", 10)
+        self._infer_count_pub = self.create_publisher(Int32, "/e6/inference/count", 10)
+        self._infer_call_count: int = 0
 
         self._server_host = host
         self._server_port = port
@@ -216,6 +218,8 @@ class InferenceBridgeNode(Node):
 
     def _run_infer(self, obs: dict):
         try:
+            self._infer_call_count += 1
+            self._infer_count_pub.publish(Int32(data=self._infer_call_count))
             result = self._policy.infer(obs)
             actions = np.asarray(result["actions"], dtype=np.float32)  # (16, 7)
             state = obs["observation/state"]

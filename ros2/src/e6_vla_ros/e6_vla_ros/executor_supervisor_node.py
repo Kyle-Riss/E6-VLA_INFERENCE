@@ -48,11 +48,15 @@ import threading
 import time
 from pathlib import Path
 
+import math
+import xml.etree.ElementTree as ET
+
 import numpy as np
 import rclpy
+import xacro
 from rclpy.node import Node
 from sensor_msgs.msg import Image
-from std_msgs.msg import Float32MultiArray, Float32, String
+from std_msgs.msg import Float32MultiArray, Float32, String, Int32
 from std_srvs.srv import Trigger
 
 # ── Dobot SDK 경로 ───────────────────────────────────────────────────────────
@@ -71,6 +75,34 @@ for _p in [str(_HARDWARE), str(_DOBOT_SDK)]:
 
 ACTION_DIM = 7
 ACTION_HORIZON = 16
+
+_XACRO_PATH = _REPO / "ros2/src/e6_description/urdf/me6_robot.xacro"
+_JOINT_NAMES = ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6"]
+
+
+def _load_joint_limits_deg() -> tuple[np.ndarray, np.ndarray]:
+    """me6_robot.xacro에서 revolute 관절 위치 한계를 읽어 degree 단위로 반환."""
+    try:
+        doc = xacro.process_file(str(_XACRO_PATH))
+        root = ET.fromstring(doc.toxml())
+    except Exception as exc:
+        raise RuntimeError(f"xacro 파싱 실패: {exc}")
+
+    limits: dict[str, tuple[float, float]] = {}
+    for joint in root.iter("joint"):
+        name = joint.get("name", "")
+        if name not in _JOINT_NAMES:
+            continue
+        lim = joint.find("limit")
+        if lim is None:
+            continue
+        lower = math.degrees(float(lim.get("lower", "-360")))
+        upper = math.degrees(float(lim.get("upper",  "360")))
+        limits[name] = (lower, upper)
+
+    mins = np.array([limits[n][0] for n in _JOINT_NAMES], dtype=np.float32)
+    maxs = np.array([limits[n][1] for n in _JOINT_NAMES], dtype=np.float32)
+    return mins, maxs
 
 
 class ExecutorSupervisorNode(Node):
@@ -166,6 +198,14 @@ class ExecutorSupervisorNode(Node):
         self._scripted_lift_stall_z = self.get_parameter("scripted_lift_stall_z").value
         self._scripted_lift_dz_thresh = self.get_parameter("scripted_lift_dz_thresh").value
 
+        # URDF 관절 위치 한계 (degree)
+        self._joint_min_deg, self._joint_max_deg = _load_joint_limits_deg()
+        self.get_logger().info(
+            f"URDF joint limits 로드 완료: "
+            f"min={self._joint_min_deg.tolist()} "
+            f"max={self._joint_max_deg.tolist()}"
+        )
+
         # 청크 상태
         self._chunk: np.ndarray | None = None       # (16, 7)
         self._chunk_idx = 0
@@ -199,6 +239,14 @@ class ExecutorSupervisorNode(Node):
 
         # B+C 종료 조건 상태
         self._step_count = 0
+
+        # ── 성능 측정 변수 ────────────────────────────────────────────────────
+        self._move_start_time: float | None = None   # 첫 움직임 시각
+        self._total_chunk_rcv: int = 0               # 수신된 청크 총 수
+        self._chunk_count_at_move_start: int = 0     # 첫 움직임 시점의 청크 수
+        self._infer_count: int = 0                   # 실제 궤적 계산 호출 수 (inference_bridge)
+        self._infer_count_at_move_start: int = 0     # 첫 움직임 시점의 궤적 계산 수
+        self._metrics_saved: bool = False            # suction ON 시 1회만 저장
         self._home_consec = 0
         # j1..j3 기준 init 자세 (INIT_POSE_DEG 고정값 사용)
         self._init_joints_j123 = np.array(self.INIT_POSE_DEG[:3], dtype=np.float32)
@@ -218,6 +266,7 @@ class ExecutorSupervisorNode(Node):
 
         # 구독
         self.create_subscription(Float32MultiArray, "/e6/policy/action_chunk", self._cb_chunk,       10)
+        self.create_subscription(Int32,             "/e6/inference/count",     self._cb_infer_count, 10)
         self.create_subscription(Image,             "/e6/camera/image",         self._cb_img,         10)
         self.create_subscription(Float32MultiArray, "/e6/robot/state",          self._cb_state,       10)
         self.create_subscription(Float32,           "/e6/robot/tcp_z",          self._cb_tcpz,        10)
@@ -279,11 +328,15 @@ class ExecutorSupervisorNode(Node):
 
     # ── 구독 콜백 ────────────────────────────────────────────────────────────
 
+    def _cb_infer_count(self, msg: Int32):
+        self._infer_count = msg.data
+
     def _cb_chunk(self, msg: Float32MultiArray):
         data = np.array(msg.data, dtype=np.float32)
         if data.size != ACTION_HORIZON * ACTION_DIM:
             self.get_logger().warn(f"chunk 크기 이상: {data.size}")
             return
+        self._total_chunk_rcv += 1
         with self._chunk_lock:
             self._chunk = data.reshape(ACTION_HORIZON, ACTION_DIM)[:self._steps_per_inference]
             self._chunk_idx = 0
@@ -420,6 +473,24 @@ class ExecutorSupervisorNode(Node):
                     f"max={np.abs(delta).max():.2f}°",
                     throttle_duration_sec=1.0,
                 )
+
+        # URDF 관절 위치 한계 클램프 (속도 제한과 별개로 절대 범위 초과 방지)
+        over_min = target_deg < self._joint_min_deg
+        over_max = target_deg > self._joint_max_deg
+        if over_min.any() or over_max.any():
+            self.get_logger().warn(
+                f"joint limit 초과 클램프: "
+                f"min_viol={np.where(over_min)[0].tolist()} "
+                f"max_viol={np.where(over_max)[0].tolist()}",
+                throttle_duration_sec=1.0,
+            )
+        target_deg = np.clip(target_deg, self._joint_min_deg, self._joint_max_deg)
+
+        # 첫 움직임 감지
+        if self._move_start_time is None and np.max(np.abs(delta)) > 0.05:
+            self._move_start_time = time.monotonic()
+            self._chunk_count_at_move_start = self._total_chunk_rcv
+            self._infer_count_at_move_start = self._infer_count
 
         # 그리퍼 hysteresis
         if self._action_mode == "delta" and self._gripper_mode == "delta":
@@ -623,6 +694,31 @@ class ExecutorSupervisorNode(Node):
                     )
             except Exception as exc:
                 self.get_logger().warn(f"로봇 명령 실패 ({self._control_mode}): {exc}", throttle_duration_sec=2.0)
+
+        # ── suction ON 전환 감지 → 성능 측정 저장 ───────────────────────────
+        if tool_on == 1 and self._last_gripper == 0 and not self._metrics_saved:
+            self._metrics_saved = True
+            suction_on_time = time.monotonic()
+            suction_on_str = __import__("datetime").datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            elapsed = (suction_on_time - self._move_start_time) if self._move_start_time is not None else float("nan")
+            chunks_used = self._total_chunk_rcv - self._chunk_count_at_move_start
+            infer_used = self._infer_count - self._infer_count_at_move_start
+            lines = [
+                "=" * 50,
+                f"[Inference Metrics]",
+                f"  suction ON 시각     : {suction_on_str}",
+                f"  이동 시작 → ON 시간 : {elapsed:.2f} 초",
+                f"  궤적 계산 호출 횟수 : {infer_used} 회",
+                f"  총 소요 시간        : {elapsed:.2f} 초",
+                "=" * 50,
+                "",
+            ]
+            log_path = __import__("os").path.expanduser("~/Desktop/inference_metrics.txt")
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+            self.get_logger().info(
+                f"[METRICS] suction ON — 이동→ON: {elapsed:.2f}s, 청크: {chunks_used}회 → {log_path}"
+            )
 
         self._last_gripper = tool_on
         self._gripper_cmd_pub.publish(Float32(data=float(tool_on)))

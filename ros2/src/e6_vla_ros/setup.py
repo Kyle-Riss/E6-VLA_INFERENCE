@@ -17,6 +17,7 @@ setup(
             'executor_supervisor_node = e6_vla_ros.executor_supervisor_node:main',
             'task_node                = e6_vla_ros.task_node:main',
             'voice_command_node       = e6_vla_ros.voice_command_node:main',
+            'e6_visualization_node    = e6_vla_ros.e6_visualization_node:main',
         ],
     },
 )

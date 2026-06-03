@@ -6,15 +6,15 @@ from launch import LaunchDescription
 from launch_ros.actions import Node
 from launch.actions import DeclareLaunchArgument, ExecuteProcess
 from launch.conditions import IfCondition
-from launch.substitutions import LaunchConfiguration, PythonExpression
+from launch.substitutions import LaunchConfiguration, PythonExpression, Command
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description():
     _urdf_file = os.path.join(
         get_package_share_directory('e6_description'), 'urdf', 'me6_robot.xacro'
     )
-    with open(_urdf_file) as f:
-        _robot_description = f.read()
+    _robot_description = ParameterValue(Command(['xacro ', _urdf_file]), value_type=str)
 
     return LaunchDescription([
         # ── 인자 선언 ──────────────────────────────────────────────────────
@@ -177,6 +177,14 @@ def generate_launch_description():
                 "min_hold_frames":   LaunchConfiguration("min_hold_frames"),
                 "pick_prearm_z":     LaunchConfiguration("pick_prearm_z"),
             }],
+        ),
+
+        # ── 노드 5-b: e6_visualization_node ──────────────────────────────────
+        Node(
+            package='e6_vla_ros',
+            executable='e6_visualization_node',
+            name='e6_visualization_node',
+            output='screen',
         ),
 
         # ── 노드 5: robot_state_publisher ─────────────────────────────────────
