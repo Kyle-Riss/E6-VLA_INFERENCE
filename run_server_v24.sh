@@ -27,7 +27,7 @@ source ~/move-one/min-imum/move-one/bin/activate
 
 export MVCAM_COMMON_RUNENV=/opt/MVS/lib
 export PYTHONPATH="$REPO/src:$PYTHONPATH"
-export LD_LIBRARY_PATH="$HOME/DobotControl/min-imum/move-one/lib/python3.10/site-packages/nvidia/cusparselt/lib:$LD_LIBRARY_PATH"
+export LD_LIBRARY_PATH="$HOME/move-one/min-imum/move-one/lib/python3.10/site-packages/nvidia/cusparselt/lib:$LD_LIBRARY_PATH"
 export TORCHDYNAMO_DISABLE=1
 
 echo "=============================="
