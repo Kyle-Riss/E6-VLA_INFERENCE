@@ -27,7 +27,7 @@ executor_supervisor_node — 액션 실행 + 안전 감시
   movj_accel            (int,   default 60)
   chunk_staleness_sec   (float, default 5.0)
   steps_per_inference   (int,   default 8)    — 청크에서 실행할 스텝 수 (0=전체)
-  executor_hz           (float, default 18.0) — MovJ 전송 주파수 (낮출수록 느려짐)
+  executor_hz           (float, default 16.0) — MovJ 전송 주파수 (낮출수록 느려짐)
   approach_z_done       (float, default 85.0) — approach 완료: TCP Z ≤ 이 값 (mm)
   lift_z_done           (float, default 200.0)— pick/place 완료: TCP Z ≥ 이 값 (mm)
   stage_done_steps      (int,   default 3)    — 완료 조건 연속 만족 스텝 수
@@ -58,6 +58,8 @@ from rclpy.node import Node
 from sensor_msgs.msg import Image
 from std_msgs.msg import Float32MultiArray, Float32, String, Int32
 from std_srvs.srv import Trigger
+
+from e6_vla_ros.trajectory_smoother import MPCSmoother, DEFAULT_PHASE_WEIGHTS
 
 # ── Dobot SDK 경로 ───────────────────────────────────────────────────────────
 def _find_repo_root() -> Path:
@@ -139,8 +141,8 @@ class ExecutorSupervisorNode(Node):
         self.declare_parameter("lift_z_done", 200.0)
         self.declare_parameter("stage_done_steps", 3)
         self.declare_parameter("bad_camera_consecutive", 10)
-        self.declare_parameter("vacuum_check_enabled", False)
-        self.declare_parameter("vacuum_check_z", 85.0)
+        self.declare_parameter("vacuum_check_enabled", True)
+        self.declare_parameter("vacuum_check_z", 85.0)  # 미사용 — grip_enable_z가 z 게이트 역할 대신함
         self.declare_parameter("vacuum_timeout_sec", 1.0)
         self.declare_parameter("camera_black_mean", 8.0)
         self.declare_parameter("place_force_release_enabled", False)
@@ -156,6 +158,24 @@ class ExecutorSupervisorNode(Node):
         self.declare_parameter("scripted_lift_wait_frames", 48)  # 대기 프레임 수 (3초@16Hz)
         self.declare_parameter("scripted_lift_stall_z", 160.0)   # 이 Z 미달이면 stall 판정
         self.declare_parameter("scripted_lift_dz_thresh", 0.3)   # mm/frame 이하이면 stall
+        # scripted return: VLA가 release phase에서 상승 못할 때 강제 MovL로 올림
+        self.declare_parameter("scripted_return_enabled", True)
+        self.declare_parameter("scripted_return_target_z", 200.0)  # 목표 Z (mm)
+        self.declare_parameter("scripted_return_wait_frames", 16)  # 1초@16Hz 대기
+        self.declare_parameter("scripted_return_stall_z", 150.0)   # 이 Z 미달이면 stall 판정
+        # MPC-lite: 1-step lookahead EMA smoothing (2×2 ablation 실험용)
+        self.declare_parameter("use_mpc_lite", False)
+        self.declare_parameter("mpc_alpha", 0.7)  # EMA weight — alpha*현재 + (1-alpha)*다음
+        # QP-MPC v1: chunk-level receding-horizon joint-space optimizer (3-way ablation 3번째 arm)
+        # use_mpc=false면 기존 동작 그대로 (기본값). use_mpc_lite와 상호배타(use_mpc 우선).
+        self.declare_parameter("use_mpc", False)
+        self.declare_parameter("mpc_horizon", 0)        # 0 → steps_per_inference
+        self.declare_parameter("mpc_w_track", 1.0)
+        self.declare_parameter("mpc_w_vel", 0.1)
+        self.declare_parameter("mpc_w_acc", 0.05)
+        self.declare_parameter("mpc_w_jerk", 0.02)
+        self.declare_parameter("mpc_backend", "scipy")  # "scipy"(기본) | "osqp"
+        self.declare_parameter("mpc_a_max", 2.0)        # deg/step^2 (hard_accel 옵션용; 기본 soft)
 
         self._dry_run = self.get_parameter("dry_run").value
         self._no_camera = self.get_parameter("no_camera").value
@@ -176,7 +196,7 @@ class ExecutorSupervisorNode(Node):
         self._staleness_sec = self.get_parameter("chunk_staleness_sec").value
         _spi = self.get_parameter("steps_per_inference").value
         self._steps_per_inference = _spi if _spi > 0 else ACTION_HORIZON
-        _executor_hz = self.get_parameter("executor_hz").value
+        _executor_hz = float(self.get_parameter("executor_hz").value)
         self._approach_z_done = self.get_parameter("approach_z_done").value
         self._lift_z_done = self.get_parameter("lift_z_done").value
         self._stage_done_steps = self.get_parameter("stage_done_steps").value
@@ -197,6 +217,22 @@ class ExecutorSupervisorNode(Node):
         self._scripted_lift_wait_frames = self.get_parameter("scripted_lift_wait_frames").value
         self._scripted_lift_stall_z = self.get_parameter("scripted_lift_stall_z").value
         self._scripted_lift_dz_thresh = self.get_parameter("scripted_lift_dz_thresh").value
+        self._scripted_return_enabled = self.get_parameter("scripted_return_enabled").value
+        self._scripted_return_target_z = self.get_parameter("scripted_return_target_z").value
+        self._scripted_return_wait_frames = self.get_parameter("scripted_return_wait_frames").value
+        self._scripted_return_stall_z = self.get_parameter("scripted_return_stall_z").value
+        self._use_mpc_lite = self.get_parameter("use_mpc_lite").value
+        self._mpc_alpha    = float(self.get_parameter("mpc_alpha").value)
+        self._use_mpc      = self.get_parameter("use_mpc").value
+        self._mpc_backend  = self.get_parameter("mpc_backend").value
+        _mpc_h             = int(self.get_parameter("mpc_horizon").value)
+        self._mpc_horizon  = _mpc_h if _mpc_h > 0 else self._steps_per_inference
+        self._mpc_w_track  = float(self.get_parameter("mpc_w_track").value)
+        self._mpc_w_vel    = float(self.get_parameter("mpc_w_vel").value)
+        self._mpc_w_acc    = float(self.get_parameter("mpc_w_acc").value)
+        self._mpc_w_jerk   = float(self.get_parameter("mpc_w_jerk").value)
+        self._mpc_a_max    = float(self.get_parameter("mpc_a_max").value)
+        self._executor_hz  = _executor_hz   # MPC dt 계산용 (helper에서 사용)
 
         # URDF 관절 위치 한계 (degree)
         self._joint_min_deg, self._joint_max_deg = _load_joint_limits_deg()
@@ -212,8 +248,31 @@ class ExecutorSupervisorNode(Node):
         self._chunk_t = 0.0                          # 수신 시각
         self._chunk_lock = threading.Lock()
 
+        # ── QP-MPC v1: smoother + 캐시 ────────────────────────────────────────
+        self._chunk_smoothed: np.ndarray | None = None   # (N,6) 절대 joint target
+        self._smoother = None
+        if self._use_mpc:
+            self._smoother = MPCSmoother(
+                horizon=self._mpc_horizon, n_joints=6, dt=1.0 / _executor_hz,
+                w_track=self._mpc_w_track, w_vel=self._mpc_w_vel,
+                w_acc=self._mpc_w_acc, w_jerk=self._mpc_w_jerk,
+                q_min=self._joint_min_deg, q_max=self._joint_max_deg,
+                dq_max=self._max_delta, a_max=self._mpc_a_max,
+                action_scale=1.0,   # action_scale은 executor에서 pre-multiply (L514 의미 유지)
+                backend=self._mpc_backend, phase_weights=DEFAULT_PHASE_WEIGHTS,
+                logger=self.get_logger())
+            self.get_logger().info(
+                f"[MPC] QP optimizer ON — backend={self._smoother.backend} "
+                f"horizon={self._mpc_horizon} w=(t{self._mpc_w_track},v{self._mpc_w_vel},"
+                f"a{self._mpc_w_acc},j{self._mpc_w_jerk}) dq_max={self._max_delta}"
+            )
+        self._qp_clamp_hits = 0   # post-QP 안전클램프가 값을 바꾼 step 수 (QP 정상이면 ≈0)
+
         # 로봇 상태 (camera_state_node에서 구독)
         self._current_deg = np.zeros(6, dtype=np.float32)
+        self._current_vel = np.zeros(6, dtype=np.float32)   # QDActual deg/s (MPC seam IC)
+        self._have_qd = False                                # /e6/robot/state_vel 수신 여부
+        self._deg_hist: list = []                            # (t, deg6) 유한차분 fallback용
         self._tcp_z: float | None = None
         self._last_gripper = 0
         self._grip_latch_remaining = 0
@@ -247,7 +306,31 @@ class ExecutorSupervisorNode(Node):
         self._infer_count: int = 0                   # 실제 궤적 계산 호출 수 (inference_bridge)
         self._infer_count_at_move_start: int = 0     # 첫 움직임 시점의 궤적 계산 수
         self._metrics_saved: bool = False            # suction ON 시 1회만 저장
+
+        # ── 신규 실험 지표 변수 ───────────────────────────────────────────────
+        # A. Joint Angle RMSE (commanded delta 크기)
+        self._rmse_err_sq = np.zeros(6, dtype=np.float64)
+        self._rmse_count: int = 0
+        # A2. Tracking RMSE (target_N vs actual_{N+1}) — 진짜 추적 오차
+        self._track_err_sq = np.zeros(6, dtype=np.float64)
+        self._track_count: int = 0
+        self._prev_target_deg: np.ndarray | None = None
+        # A3. Smoothness — 실행 target의 2차(accel)·3차(jerk) 차분 RMS (전 arm 공통)
+        self._exec_target_hist: list = []
+        self._accel_sq = np.zeros(6, dtype=np.float64)
+        self._accel_count: int = 0
+        self._jerk_sq = np.zeros(6, dtype=np.float64)
+        self._jerk_count: int = 0
+        # B. End-Effector TCP (camera_state_node /e6/robot/tcp 구독)
+        self._current_tcp = np.zeros(6, dtype=np.float32)  # [tx,ty,tz,rx,ry,rz] mm/deg
+        # C. Execution Stability (jitter)
+        self._prev_tick_t: float | None = None
+        self._tick_intervals_ms: list = []
+        self._prev_chunk_arrival_t: float | None = None
+        self._chunk_arrival_intervals_ms: list = []
+        self._cmd_rtt_ms: list = []
         self._home_consec = 0
+        self._left_init_pose = False   # j1..j3가 init tol 밖으로 나간 적 있을 때만 HOME 종료
         # j1..j3 기준 init 자세 (INIT_POSE_DEG 고정값 사용)
         self._init_joints_j123 = np.array(self.INIT_POSE_DEG[:3], dtype=np.float32)
 
@@ -264,12 +347,19 @@ class ExecutorSupervisorNode(Node):
         self._scripted_movl_sent = False  # RelMovLUser 1회 발행 완료 여부
         self._post_lift_grip_hold = 0     # scripted lift 완료 후 grip 유지 잔여 프레임
 
+        # scripted return 상태 (release phase에서 상승 못할 때 강제 상승)
+        self._return_frame_count = 0
+        self._scripted_returning = False
+        self._scripted_return_sent = False
+
         # 구독
         self.create_subscription(Float32MultiArray, "/e6/policy/action_chunk", self._cb_chunk,       10)
         self.create_subscription(Int32,             "/e6/inference/count",     self._cb_infer_count, 10)
         self.create_subscription(Image,             "/e6/camera/image",         self._cb_img,         10)
         self.create_subscription(Float32MultiArray, "/e6/robot/state",          self._cb_state,       10)
+        self.create_subscription(Float32MultiArray, "/e6/robot/state_vel",      self._cb_state_vel,   10)
         self.create_subscription(Float32,           "/e6/robot/tcp_z",          self._cb_tcpz,        10)
+        self.create_subscription(Float32MultiArray, "/e6/robot/tcp",            self._cb_tcp,         10)
         self.create_subscription(String,            "/e6/task/prompt",          self._cb_prompt,      10)
         self.create_subscription(String,            "/e6/task/status",          self._cb_task_status, 10)
         self.create_subscription(String,            "/e6/supervisor/voice_override", self._cb_voice_override, 10)
@@ -336,11 +426,56 @@ class ExecutorSupervisorNode(Node):
         if data.size != ACTION_HORIZON * ACTION_DIM:
             self.get_logger().warn(f"chunk 크기 이상: {data.size}")
             return
+        _arr_now = time.monotonic()
+        if self._prev_chunk_arrival_t is not None:
+            self._chunk_arrival_intervals_ms.append((_arr_now - self._prev_chunk_arrival_t) * 1000.0)
+        self._prev_chunk_arrival_t = _arr_now
         self._total_chunk_rcv += 1
+        chunk = data.reshape(ACTION_HORIZON, ACTION_DIM)[:self._steps_per_inference]
+        # QP-MPC: chunk 도착 시 1회 solve (chunk-level receding horizon)
+        smoothed = self._solve_chunk_smoothed(chunk) if self._use_mpc else None
         with self._chunk_lock:
-            self._chunk = data.reshape(ACTION_HORIZON, ACTION_DIM)[:self._steps_per_inference]
+            self._chunk = chunk
+            self._chunk_smoothed = smoothed
             self._chunk_idx = 0
-            self._chunk_t = time.monotonic()
+            self._chunk_t = _arr_now
+
+    def _finite_diff_vel(self) -> np.ndarray:
+        """_deg_hist 최근 2샘플로 관절 속도(deg/s) 추정 (QDActual 미수신 시 fallback)."""
+        if len(self._deg_hist) < 2:
+            return np.zeros(6, dtype=np.float32)
+        (t1, q1), (t0, q0) = self._deg_hist[-1], self._deg_hist[-2]
+        dt = max(t1 - t0, 1e-3)
+        return ((q1 - q0) / dt).astype(np.float32)
+
+    def _solve_chunk_smoothed(self, chunk: np.ndarray):
+        """chunk(N,7) → QP smoothed 절대 joint target (N,6). 실패 시 None(→tick이 raw 사용)."""
+        if self._smoother is None:
+            return None
+        dt = 1.0 / self._executor_hz
+        anchor = self._current_deg.astype(np.float32)
+        v0_per_step = (self._current_vel if self._have_qd else self._finite_diff_vel()) * dt
+        deltas = chunk[:, :6] * self._action_scale   # action_scale pre-multiply
+        t0 = time.monotonic()
+        try:
+            sm = self._smoother.solve(
+                chunk_deltas=deltas, anchor_deg=anchor,
+                v0=v0_per_step, a0=None, phase=self._current_stage,
+                gripper_seq=chunk[:, 6], absolute=(self._action_mode != "delta"))
+        except Exception as exc:
+            self.get_logger().warn(f"[MPC] solve 외부예외: {exc}")
+            return None
+        self.get_logger().info(
+            f"[MPC] solve {(time.monotonic()-t0)*1000:.1f}ms phase={self._current_stage} "
+            f"backend={self._smoother.backend} have_qd={self._have_qd}",
+            throttle_duration_sec=2.0,
+        )
+        # 절대 target → per-step 증분으로 변환 (incremental 실행)
+        # 이유: 절대좌표를 그대로 쓰면 servoj 추종 지연 시 로봇이 max_delta로 catch-up 질주
+        #       → Dobot 충돌/과속 안전장치 trip. 증분을 현재 위치에 적용하면 baseline과 같은
+        #       자연스러운 페이스 유지 + QP smoothing 보존. 각 증분은 QP velocity 제약상 ≤ dq_max.
+        qp_delta = np.diff(np.vstack([anchor[None, :], sm.astype(np.float32)]), axis=0)
+        return qp_delta.astype(np.float32)   # (N,6) per-step delta
 
     def _cb_img(self, msg: Image):
         frame = np.frombuffer(msg.data, dtype=np.uint8)
@@ -350,9 +485,25 @@ class ExecutorSupervisorNode(Node):
         d = np.array(msg.data, dtype=np.float32)
         if d.size >= 6:
             self._current_deg = d[:6]
+            if self._use_mpc and not self._have_qd:   # 유한차분 fallback용 히스토리
+                self._deg_hist.append((time.monotonic(), d[:6].copy()))
+                if len(self._deg_hist) > 5:
+                    self._deg_hist.pop(0)
+
+    def _cb_state_vel(self, msg: Float32MultiArray):
+        d = np.array(msg.data, dtype=np.float32)
+        if d.size >= 6:
+            self._current_vel = d[:6]
+            if not self._have_qd and np.any(np.abs(d[:6]) > 1e-6):
+                self._have_qd = True   # 0이 아닌 실측 속도 1회 수신 → QDActual 사용
 
     def _cb_tcpz(self, msg: Float32):
         self._tcp_z = msg.data
+
+    def _cb_tcp(self, msg: Float32MultiArray):
+        d = np.array(msg.data, dtype=np.float32)
+        if d.size >= 6:
+            self._current_tcp = d[:6]
 
     def _cb_task_status(self, msg: String):
         if msg.data == "TASK_COMPLETE" and not self._task_complete:
@@ -360,6 +511,7 @@ class ExecutorSupervisorNode(Node):
             self.get_logger().info("TASK_COMPLETE 수신 → 모션 정지")
             with self._chunk_lock:
                 self._chunk = None
+                self._chunk_smoothed = None
                 self._chunk_idx = 0
 
     def _cb_prompt(self, msg: String):
@@ -375,6 +527,8 @@ class ExecutorSupervisorNode(Node):
             stage = "move"
         elif "place" in prompt:
             stage = "place"
+        elif "release" in prompt:
+            stage = "release"
         else:
             stage = prompt
         if stage != self._current_stage:
@@ -394,12 +548,23 @@ class ExecutorSupervisorNode(Node):
                 self._lift_vacuum_confirmed = False
                 self._scripted_movl_sent = False
                 self._post_lift_grip_hold = 0
+            # release 진입 시 scripted return 카운터 리셋
+            if stage == "release":
+                self._return_frame_count = 0
+                self._scripted_returning = False
+                self._scripted_return_sent = False
 
     # ── 20Hz 실행 루프 ───────────────────────────────────────────────────────
 
     def _executor_tick(self):
         if self._emergency_stop or self._task_complete:
             return
+
+        # ── tick 간격 측정 (execution stability) ────────────────────────────
+        _tick_now = time.monotonic()
+        if self._prev_tick_t is not None:
+            self._tick_intervals_ms.append((_tick_now - self._prev_tick_t) * 1000.0)
+        self._prev_tick_t = _tick_now
 
         # 시작 자세 대기: j1..j3이 INIT_POSE 기준 home_tol_deg 이내 8프레임 연속 → 해제
         if self._init_hold:
@@ -425,6 +590,7 @@ class ExecutorSupervisorNode(Node):
 
         with self._chunk_lock:
             chunk = self._chunk
+            smoothed = self._chunk_smoothed
             idx = self._chunk_idx
             chunk_t = self._chunk_t
 
@@ -441,15 +607,22 @@ class ExecutorSupervisorNode(Node):
         if time.monotonic() - chunk_t > self._staleness_sec:
             with self._chunk_lock:
                 self._chunk = None
+                self._chunk_smoothed = None
             self.get_logger().warn("chunk staleness 초과 → 폐기")
             return
 
         if idx >= len(chunk):
             return  # 청크 소진, 다음 chunk 대기
 
-        a = chunk[idx]  # (7,)
+        a = chunk[idx]  # (7,) — gripper a[6]는 MPC와 무관하게 raw passthrough
 
-        if self._action_mode == "delta":
+        if self._use_mpc and smoothed is not None and idx < len(smoothed):
+            # QP-MPC: 미리 푼 per-step 증분을 현재 실제 위치에 적용 (incremental 실행)
+            # gripper는 a[6] 그대로 passthrough. 증분은 QP가 ≤dq_max 보장하나 안전상 재클램프.
+            delta = np.clip(np.asarray(smoothed[idx], dtype=np.float32),
+                            -self._max_delta, self._max_delta)
+            target_deg = self._current_deg + delta
+        elif self._action_mode == "delta":
             # v8: velocity delta — action[:6] = deg/frame, 현재 위치에 누산
             delta = np.asarray(a[:6], dtype=np.float32) * self._action_scale
             clipped = np.abs(delta) > self._max_delta
@@ -474,10 +647,21 @@ class ExecutorSupervisorNode(Node):
                     throttle_duration_sec=1.0,
                 )
 
+        # ── QP-MPC emergency guard: max_delta 재클램프 (공통 안전 바닥) ───────
+        # QP가 dq_max를 지키면 거의 안 걸려야 함 → 걸리면 _qp_clamp_hits 증가(진단 신호)
+        if self._use_mpc and smoothed is not None:
+            _md = np.clip(target_deg - self._current_deg, -self._max_delta, self._max_delta)
+            _tgt2 = self._current_deg + _md
+            if np.any(np.abs(_tgt2 - target_deg) > 1e-4):
+                self._qp_clamp_hits += 1
+            target_deg = _tgt2
+
         # URDF 관절 위치 한계 클램프 (속도 제한과 별개로 절대 범위 초과 방지)
         over_min = target_deg < self._joint_min_deg
         over_max = target_deg > self._joint_max_deg
         if over_min.any() or over_max.any():
+            if self._use_mpc and smoothed is not None:
+                self._qp_clamp_hits += 1
             self.get_logger().warn(
                 f"joint limit 초과 클램프: "
                 f"min_viol={np.where(over_min)[0].tolist()} "
@@ -485,6 +669,52 @@ class ExecutorSupervisorNode(Node):
                 throttle_duration_sec=1.0,
             )
         target_deg = np.clip(target_deg, self._joint_min_deg, self._joint_max_deg)
+
+        # ── MPC-lite: 1-step lookahead EMA smoothing (use_mpc_lite:=true 시) ─
+        # 다음 스텝 target을 미리 계산해 EMA 적용 → step간 방향 급변(jerk) 완화
+        # use_mpc(QP)가 켜지면 비활성화 (3-way arm 상호배타)
+        if (not self._use_mpc) and self._use_mpc_lite and idx + 1 < len(chunk):
+            a_next = chunk[idx + 1]
+            if self._action_mode == "delta":
+                delta_next = np.asarray(a_next[:6], dtype=np.float32) * self._action_scale
+                delta_next = np.clip(delta_next, -self._max_delta, self._max_delta)
+                target_next = np.clip(
+                    self._current_deg + delta_next,
+                    self._joint_min_deg, self._joint_max_deg
+                )
+            else:
+                delta_next = np.asarray(a_next[:6], dtype=np.float32) - self._current_deg
+                delta_next = np.clip(delta_next, -self._max_delta, self._max_delta)
+                target_next = np.clip(
+                    self._current_deg + delta_next,
+                    self._joint_min_deg, self._joint_max_deg
+                )
+            target_deg = self._mpc_alpha * target_deg + (1.0 - self._mpc_alpha) * target_next
+
+        # ── Joint Angle RMSE 누적 ────────────────────────────────────────────
+        _err = target_deg - self._current_deg   # commanded delta (속도 크기)
+        self._rmse_err_sq += _err.astype(np.float64) ** 2
+        self._rmse_count += 1
+        # Tracking RMSE: 이전 step 목표 vs 현재 실제 (진짜 추적 오차)
+        if self._prev_target_deg is not None:
+            _track_err = self._prev_target_deg - self._current_deg
+            self._track_err_sq += _track_err.astype(np.float64) ** 2
+            self._track_count += 1
+        self._prev_target_deg = target_deg.copy()
+
+        # ── Smoothness: 실행 target의 2차(accel)·3차(jerk) 차분 RMS (전 arm 공통) ─
+        self._exec_target_hist.append(target_deg.astype(np.float64).copy())
+        if len(self._exec_target_hist) > 4:
+            self._exec_target_hist.pop(0)
+        h = self._exec_target_hist
+        if len(h) >= 3:
+            acc = h[-1] - 2 * h[-2] + h[-3]
+            self._accel_sq += acc ** 2
+            self._accel_count += 1
+        if len(h) >= 4:
+            jrk = h[-1] - 3 * h[-2] + 3 * h[-3] - h[-4]
+            self._jerk_sq += jrk ** 2
+            self._jerk_count += 1
 
         # 첫 움직임 감지
         if self._move_start_time is None and np.max(np.abs(delta)) > 0.05:
@@ -659,6 +889,47 @@ class ExecutorSupervisorNode(Node):
                         f"[SCRIPTED_LIFT] 목표 도달 z={z_now:.1f}mm → VLA 복귀, grip hold 32f"
                     )
 
+        # ── scripted return: release phase에서 VLA가 상승 못할 때 강제 상승 ────
+        use_scripted_return = False
+        if (self._scripted_return_enabled
+                and self._current_stage == "release"
+                and self._dashboard is not None
+                and not self._dry_run
+                and self._tcp_z is not None
+                and not camera_hold
+                and self._last_gripper == 0):
+            z_now = self._tcp_z
+            self._return_frame_count += 1
+            stall = (self._return_frame_count >= self._scripted_return_wait_frames
+                     and z_now < self._scripted_return_stall_z)
+            if stall or self._scripted_returning:
+                if not self._scripted_returning:
+                    self._scripted_returning = True
+                    self.get_logger().info(
+                        f"[SCRIPTED_RETURN] stall 감지 → 강제 상승 시작 "
+                        f"z={z_now:.1f}mm frame={self._return_frame_count}"
+                    )
+                if z_now < self._scripted_return_target_z:
+                    use_scripted_return = True
+                    if not self._scripted_return_sent:
+                        dz = self._scripted_return_target_z - z_now
+                        try:
+                            self._dashboard.RelMovLUser(0, 0, dz, 0, 0, 0,
+                                                        v=self._movj_v, a=self._movj_a)
+                            self._scripted_return_sent = True
+                            self.get_logger().info(
+                                f"[SCRIPTED_RETURN] RelMovLUser dz=+{dz:.1f}mm "
+                                f"(z={z_now:.1f}mm → {self._scripted_return_target_z:.1f}mm)"
+                            )
+                        except Exception as exc:
+                            self.get_logger().warn(f"[SCRIPTED_RETURN] RelMovLUser 실패: {exc}")
+                else:
+                    self._scripted_returning = False
+                    self._scripted_return_sent = False
+                    self.get_logger().info(
+                        f"[SCRIPTED_RETURN] 목표 도달 z={z_now:.1f}mm → VLA 복귀"
+                    )
+
         # 로봇 명령 전송
         if self._dashboard is not None:
             try:
@@ -668,8 +939,14 @@ class ExecutorSupervisorNode(Node):
                         f"[SCRIPTED_LIFT] 상승 중 z={self._tcp_z:.1f}mm",
                         throttle_duration_sec=1.0,
                     )
+                elif use_scripted_return:
+                    self.get_logger().info(
+                        f"[SCRIPTED_RETURN] 상승 중 z={self._tcp_z:.1f}mm",
+                        throttle_duration_sec=1.0,
+                    )
                 elif not camera_hold:
                     j1, j2, j3, j4, j5, j6 = (float(x) for x in target_deg)
+                    _cmd_t0 = time.monotonic()
                     if self._control_mode == "servoj":
                         self._dashboard.ServoJ(
                             j1, j2, j3, j4, j5, j6,
@@ -680,6 +957,7 @@ class ExecutorSupervisorNode(Node):
                     else:
                         self._dashboard.MovJ(j1, j2, j3, j4, j5, j6, 1,
                                              v=self._movj_v, a=self._movj_a)
+                    self._cmd_rtt_ms.append((time.monotonic() - _cmd_t0) * 1000.0)
                 self._dashboard.ToolDO(1, tool_on)
 
                 # 실행 로그: 처음 5스텝 + 이후 10스텝마다
@@ -703,16 +981,73 @@ class ExecutorSupervisorNode(Node):
             elapsed = (suction_on_time - self._move_start_time) if self._move_start_time is not None else float("nan")
             chunks_used = self._total_chunk_rcv - self._chunk_count_at_move_start
             infer_used = self._infer_count - self._infer_count_at_move_start
+            _arm = ("QP-optimizer" if self._use_mpc
+                    else ("lookahead" if self._use_mpc_lite else "safety-clamp"))
             lines = [
                 "=" * 50,
                 f"[Inference Metrics]",
+                f"  arm                 : {_arm}",
+                f"  mpc_backend         : {self._smoother.backend if self._use_mpc and self._smoother else '-'}",
+                f"  control_mode        : {self._control_mode}",
                 f"  suction ON 시각     : {suction_on_str}",
                 f"  이동 시작 → ON 시간 : {elapsed:.2f} 초",
                 f"  궤적 계산 호출 횟수 : {infer_used} 회",
                 f"  총 소요 시간        : {elapsed:.2f} 초",
-                "=" * 50,
-                "",
             ]
+            # A. Joint Angle RMSE (commanded delta 크기)
+            if self._rmse_count > 0:
+                rmse_j = np.sqrt(self._rmse_err_sq / self._rmse_count)
+                lines += [
+                    f"  Joint delta RMS j1~j6: {' '.join(f'{v:.3f}' for v in rmse_j)} deg",
+                    f"  Joint delta RMS avg  : {float(np.mean(rmse_j)):.3f} deg",
+                ]
+            # A2. Tracking RMSE (target_N vs actual_{N+1}, 진짜 추적 오차)
+            if self._track_count > 0:
+                track_j = np.sqrt(self._track_err_sq / self._track_count)
+                lines += [
+                    f"  Tracking RMSE j1~j6 : {' '.join(f'{v:.3f}' for v in track_j)} deg",
+                    f"  Tracking RMSE avg   : {float(np.mean(track_j)):.3f} deg",
+                ]
+            # A3. Smoothness (실행 target accel/jerk RMS) — 3-way arm 비교 핵심 지표
+            if self._accel_count > 0:
+                acc_j = np.sqrt(self._accel_sq / self._accel_count)
+                lines += [
+                    f"  Exec accel RMS avg  : {float(np.mean(acc_j)):.4f} deg (2nd diff)",
+                ]
+            if self._jerk_count > 0:
+                jrk_j = np.sqrt(self._jerk_sq / self._jerk_count)
+                lines += [
+                    f"  Exec jerk RMS j1~j6 : {' '.join(f'{v:.4f}' for v in jrk_j)} deg",
+                    f"  Exec jerk RMS avg   : {float(np.mean(jrk_j)):.4f} deg (3rd diff)",
+                ]
+            if self._use_mpc:
+                lines.append(f"  post-QP clamp hits  : {self._qp_clamp_hits} (QP 정상이면 ≈0)")
+            # B. End-Effector TCP position at suction ON
+            tcp = self._current_tcp
+            lines.append(
+                f"  TCP@suction ON (mm) : X={tcp[0]:.1f} Y={tcp[1]:.1f} Z={tcp[2]:.1f}"
+            )
+            # C. Execution Stability
+            if self._tick_intervals_ms:
+                ti = np.array(self._tick_intervals_ms)
+                lines.append(
+                    f"  Executor tick       : mean={np.mean(ti):.1f}ms "
+                    f"std={np.std(ti):.1f}ms "
+                    f"min={np.min(ti):.1f} max={np.max(ti):.1f}"
+                )
+            if self._chunk_arrival_intervals_ms:
+                ci = np.array(self._chunk_arrival_intervals_ms)
+                lines.append(
+                    f"  Chunk interval      : mean={np.mean(ci):.1f}ms "
+                    f"std={np.std(ci):.1f}ms"
+                )
+            if self._cmd_rtt_ms:
+                ri = np.array(self._cmd_rtt_ms)
+                lines.append(
+                    f"  Cmd RTT             : mean={np.mean(ri):.2f}ms "
+                    f"std={np.std(ri):.2f}ms"
+                )
+            lines += ["=" * 50, ""]
             log_path = __import__("os").path.expanduser("~/Desktop/inference_metrics.txt")
             with open(log_path, "a", encoding="utf-8") as f:
                 f.write("\n".join(lines) + "\n")
@@ -745,22 +1080,23 @@ class ExecutorSupervisorNode(Node):
                     pass
 
                 if di == 1:
-                    # 흡착 확인 → 청크 리셋 + transport 페이즈 전환
+                    # 흡착 확인 → 청크 리셋 + lift 시작
                     self._vacuum_confirmed = True
                     with self._chunk_lock:
                         self._chunk = None
+                        self._chunk_smoothed = None
                         self._chunk_idx = 0
                     self.get_logger().info(
-                        f"[VACUUM] 흡착 확인 (z={self._tcp_z:.1f}mm) → 청크 리셋, transport 전환"
+                        f"[VACUUM] 흡착 확인 (z={self._tcp_z:.1f}mm) → 청크 리셋, lift 시작"
                         if self._tcp_z is not None else "[VACUUM] 흡착 확인 → 청크 리셋"
                     )
                 elif (now - self._gripper_on_since) > self._vacuum_timeout_sec:
-                    # timeout → 집기 실패
+                    # timeout이지만 emergency stop 없이 계속 하강
+                    # 물리 접촉까지 계속 내려가다가 ToolDI=1 감지되면 올라감
                     self.get_logger().warn(
-                        f"[VACUUM] {self._vacuum_timeout_sec:.1f}s 내 흡착 미감지 → pick FAIL"
+                        f"[VACUUM] {self._vacuum_timeout_sec:.1f}s 내 흡착 미감지 — 계속 하강",
+                        throttle_duration_sec=2.0,
                     )
-                    self._emergency_stop = True
-                    self._status = "FAIL_PICK:vacuum_timeout"
 
         with self._chunk_lock:
             self._chunk_idx += 1
@@ -777,9 +1113,12 @@ class ExecutorSupervisorNode(Node):
             self._status_pub.publish(String(data="TASK_COMPLETE"))
             return
 
-        # C: init 자세 복귀 감지 → 정상 종료 (min_steps 이후부터만)
-        if self._step_count > self._min_steps:
-            j_diff = np.abs(self._current_deg[:3] - self._init_joints_j123)
+        # C: init 자세 복귀 감지 → 정상 종료 (min_steps 이후 + init 이탈 경험 후만)
+        j_diff = np.abs(self._current_deg[:3] - self._init_joints_j123)
+        if j_diff.max() >= self._home_tol_deg:
+            self._left_init_pose = True
+
+        if self._step_count > self._min_steps and self._left_init_pose:
             if j_diff.max() < self._home_tol_deg:
                 self._home_consec += 1
                 if self._home_consec >= self._home_consec_req:

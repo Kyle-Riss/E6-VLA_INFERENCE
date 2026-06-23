@@ -5,13 +5,17 @@ camera_state_node — HIKRobot 카메라 + ZED 카메라 + Dobot feedBack 읽기
 발행 토픽:
   /e6/camera/image        sensor_msgs/Image          18Hz  224x224 RGB  (HIK)
   /e6/camera/zed_image    sensor_msgs/Image          18Hz  224x224 RGB  (ZED left)
+  /e6/camera/image_512    sensor_msgs/Image          18Hz  512x512 RGB  (HIK, SmolVLA용, pub_smolvla_images=true 시)
+  /e6/camera/zed_image_512 sensor_msgs/Image         18Hz  512x512 RGB  (ZED, SmolVLA용, pub_smolvla_images=true 시)
   /e6/robot/state         std_msgs/Float32MultiArray 18Hz  [j1..j6 deg, gripper 0~1]
+  /e6/robot/tcp           std_msgs/Float32MultiArray 18Hz  [tx,ty,tz,rx,ry,rz mm/deg]
   /e6/robot/tcp_z         std_msgs/Float32           18Hz  TCP Z (mm)
 
 파라미터:
-  robot_ip   (str,  default "192.168.5.1")
-  dry_run    (bool, default False)  — 로봇 없이 더미 데이터
-  no_camera  (bool, default False)  — 카메라 없이 검정 이미지
+  robot_ip            (str,  default "192.168.5.1")
+  dry_run             (bool, default False)  — 로봇 없이 더미 데이터
+  no_camera           (bool, default False)  — 카메라 없이 검정 이미지
+  pub_smolvla_images  (bool, default False)  — 512x512 SmolVLA용 이미지 추가 발행
 """
 from __future__ import annotations
 
@@ -62,17 +66,24 @@ class CameraStateNode(Node):
         self.declare_parameter("dry_run", False)
         self.declare_parameter("no_camera", False)
         self.declare_parameter("camera_black_mean", 8.0)
+        self.declare_parameter("pub_smolvla_images", False)
 
         robot_ip = self.get_parameter("robot_ip").value
         self._dry_run = self.get_parameter("dry_run").value
         self._no_camera = self.get_parameter("no_camera").value
         self._camera_black_mean = self.get_parameter("camera_black_mean").value
+        self._pub_smolvla = self.get_parameter("pub_smolvla_images").value
 
         # 퍼블리셔
-        self._img_pub     = self.create_publisher(Image,             "/e6/camera/image",     10)
-        self._zed_pub     = self.create_publisher(Image,             "/e6/camera/zed_image", 10)
-        self._state_pub   = self.create_publisher(Float32MultiArray, "/e6/robot/state",      10)
-        self._tcpz_pub    = self.create_publisher(Float32,           "/e6/robot/tcp_z",      10)
+        self._img_pub     = self.create_publisher(Image,             "/e6/camera/image",      10)
+        self._zed_pub     = self.create_publisher(Image,             "/e6/camera/zed_image",  10)
+        self._state_pub   = self.create_publisher(Float32MultiArray, "/e6/robot/state",       10)
+        self._statevel_pub = self.create_publisher(Float32MultiArray, "/e6/robot/state_vel",  10)  # QDActual (MPC seam IC용)
+        self._tcp_pub     = self.create_publisher(Float32MultiArray, "/e6/robot/tcp",         10)
+        self._tcpz_pub    = self.create_publisher(Float32,           "/e6/robot/tcp_z",       10)
+        if self._pub_smolvla:
+            self._img512_pub = self.create_publisher(Image, "/e6/camera/image_512",     10)
+            self._zed512_pub = self.create_publisher(Image, "/e6/camera/zed_image_512", 10)
 
         # 하드웨어 초기화
         self._feed = None
@@ -131,6 +142,7 @@ class CameraStateNode(Node):
             status = zed.open(init_params)
             if status != sl.ERROR_CODE.SUCCESS:
                 self.get_logger().warn(f"ZED 카메라 오픈 실패: {status} → 더미 이미지")
+                zed.close()
                 return
             self._zed = zed
             self._zed_mat = sl.Mat()
@@ -160,13 +172,26 @@ class CameraStateNode(Node):
         self._zed_pub.publish(zed_msg)
 
         # 2) 로봇 상태
-        deg6, tcp_z, gripper = self._read_robot_state()
+        deg6, tcp6, gripper, vel6 = self._read_robot_state()
         state = np.array([*deg6, gripper], dtype=np.float32)
-        state_msg = Float32MultiArray(data=state.tolist())
-        self._state_pub.publish(state_msg)
+        self._state_pub.publish(Float32MultiArray(data=state.tolist()))
+        self._statevel_pub.publish(Float32MultiArray(data=vel6.tolist()))  # QDActual deg/s
 
-        # 3) TCP Z
-        self._tcpz_pub.publish(Float32(data=float(tcp_z)))
+        # 3) TCP (6D) + TCP Z
+        self._tcp_pub.publish(Float32MultiArray(data=tcp6.tolist()))
+        self._tcpz_pub.publish(Float32(data=float(tcp6[2])))
+
+        # 4) SmolVLA용 512x512 이미지 (pub_smolvla_images=true 시)
+        if self._pub_smolvla:
+            img512 = self._read_frame_512()
+            msg512 = _numpy_to_image_msg(img512)
+            msg512.header.stamp = now
+            self._img512_pub.publish(msg512)
+
+            zed512 = self._read_zed_frame_512()
+            zed512_msg = _numpy_to_image_msg(zed512)
+            zed512_msg.header.stamp = now
+            self._zed512_pub.publish(zed512_msg)
 
     # ── 이미지 읽기 ─────────────────────────────────────────────────────────
 
@@ -207,29 +232,81 @@ class CameraStateNode(Node):
 
     # ── 로봇 상태 읽기 ──────────────────────────────────────────────────────
 
-    def _read_robot_state(self) -> tuple[np.ndarray, float, float]:
-        """(deg6, tcp_z_mm, gripper 0~1) 반환. 실패 시 이전값 유지."""
+    def _read_robot_state(self) -> tuple[np.ndarray, np.ndarray, float, np.ndarray]:
+        """(deg6, tcp6, gripper 0~1, vel6 deg/s) 반환. 실패 시 이전값 유지.
+
+        vel6 = Dobot QDActual (관절 각속도). joint order는 QActual과 동일(j1~j6).
+        단위는 Dobot 펌웨어 기준 deg/s(QActual이 deg이므로 일관). MPC seam 초기조건용.
+        ⚠️ 단위 검증: j1만 천천히 움직이며 QDActual[0] vs QActual 유한차분(deg/s) 비교로 1회 확인.
+        """
         deg6 = np.zeros(6, dtype=np.float32)
-        tcp_z = 0.0
+        tcp6 = np.zeros(6, dtype=np.float32)
+        vel6 = np.zeros(6, dtype=np.float32)
 
         if self._feed is None:
-            return deg6, tcp_z, self._last_gripper
+            return deg6, tcp6, self._last_gripper, vel6
 
         try:
             fb = self._feed.feedBackData()
-            # feedBackData()는 numpy structured array (dtype=MyType) 반환
             if fb is not None and len(fb) > 0:
                 deg6 = np.asarray(fb["QActual"][0], dtype=np.float32)[:6]
-
-                tv = np.asarray(fb["ToolVectorActual"][0], dtype=np.float32)
-                tcp_z = float(tv[2])
-
-                # 그리퍼 상태는 /e6/gripper/commanded 구독으로 갱신
-                # (DigitalOutputs의 ToolDO 비트 매핑이 불명확하여 명령 상태 사용)
+                tcp6 = np.asarray(fb["ToolVectorActual"][0], dtype=np.float32)[:6]
+                vel6 = np.asarray(fb["QDActual"][0], dtype=np.float32)[:6]
+            else:
+                self.get_logger().warn(f"feedBackData None/empty", throttle_duration_sec=5.0)
         except Exception as exc:
             self.get_logger().warn(f"feedBackData 실패: {exc}", throttle_duration_sec=5.0)
 
-        return deg6, tcp_z, self._last_gripper
+        return deg6, tcp6, self._last_gripper, vel6
+
+    # ── SmolVLA용 512x512 이미지 ──────────────────────────────────────────────
+    # HIK crop: [0:480, 94:574] → 480×480 → 512×512
+    # ZED crop: [0:480, 80:560] → 480×480 → 512×512
+
+    def _read_frame_512(self) -> np.ndarray:
+        if self._camera is None:
+            return np.zeros((512, 512, 3), dtype=np.uint8)
+        try:
+            import cv2  # type: ignore
+            raw = self._camera.get_raw640()
+            if raw is not None and raw.shape == (480, 640, 3):
+                crop = raw[0:480, 94:574]
+                return cv2.resize(crop, (512, 512), interpolation=cv2.INTER_AREA).astype(np.uint8)
+        except Exception as exc:
+            self.get_logger().warn(f"HIK 512 읽기 실패: {exc}", throttle_duration_sec=5.0)
+        return np.zeros((512, 512, 3), dtype=np.uint8)
+
+    def _read_zed_frame_512(self) -> np.ndarray:
+        if self._zed is None or self._zed_mat is None:
+            return np.zeros((512, 512, 3), dtype=np.uint8)
+        try:
+            import cv2  # type: ignore
+            import pyzed.sl as sl  # type: ignore
+            if self._zed.grab() == sl.ERROR_CODE.SUCCESS:
+                self._zed.retrieve_image(self._zed_mat, sl.VIEW.LEFT)
+                frame = self._zed_mat.get_data()[:, :, :3][:, :, ::-1].copy()
+                frame = cv2.resize(frame, (640, 480))
+                crop = frame[0:480, 80:560]
+                return cv2.resize(crop, (512, 512), interpolation=cv2.INTER_AREA).astype(np.uint8)
+        except Exception as exc:
+            self.get_logger().warn(f"ZED 512 읽기 실패: {exc}", throttle_duration_sec=5.0)
+        return np.zeros((512, 512, 3), dtype=np.uint8)
+
+    def destroy_node(self):
+        if self._zed is not None:
+            try:
+                self._zed.close()
+            except Exception:
+                pass
+            self._zed = None
+            self._zed_mat = None
+        if self._camera is not None and hasattr(self._camera, "close"):
+            try:
+                self._camera.close()
+            except Exception:
+                pass
+            self._camera = None
+        super().destroy_node()
 
 
 def main(args=None):

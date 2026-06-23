@@ -5,7 +5,7 @@ from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch_ros.actions import Node
 from launch.actions import DeclareLaunchArgument, ExecuteProcess
-from launch.conditions import IfCondition
+from launch.conditions import IfCondition, UnlessCondition
 from launch.substitutions import LaunchConfiguration, PythonExpression, Command
 from launch_ros.parameter_descriptions import ParameterValue
 
@@ -28,6 +28,7 @@ def generate_launch_description():
         DeclareLaunchArgument("no_camera",           default_value="false"),
         DeclareLaunchArgument("max_delta_deg",       default_value="3.0"),
         DeclareLaunchArgument("min_tool_z",          default_value="75.0"),
+        DeclareLaunchArgument("infer_hz",            default_value="2.0"),
         DeclareLaunchArgument("steps_per_inference", default_value="8"),
         DeclareLaunchArgument("executor_hz",         default_value="16.0"),
         DeclareLaunchArgument("approach_z_done",     default_value="85.0"),
@@ -37,7 +38,7 @@ def generate_launch_description():
         DeclareLaunchArgument("movj_velocity",       default_value="70"),
         DeclareLaunchArgument("movj_accel",          default_value="60"),
         DeclareLaunchArgument("record_mcap",         default_value="false"),
-        DeclareLaunchArgument("mcap_output_dir",     default_value="/media/billye6/새 볼륨/Dobot/inference_mcap"),
+        DeclareLaunchArgument("mcap_output_dir",     default_value="/media/billye6/새 볼륨1/Dobot/inference_mcap"),
         DeclareLaunchArgument("mcap_session_id",     default_value=datetime.datetime.now().strftime("%Y%m%d_%H%M%S")),
         DeclareLaunchArgument("foxglove",            default_value="true"),
         DeclareLaunchArgument("foxglove_port",       default_value="8765"),
@@ -60,7 +61,7 @@ def generate_launch_description():
         DeclareLaunchArgument("home_consec_req",     default_value="16"),        # v13 종료 C: 연속 만족 프레임 수
         DeclareLaunchArgument("grasp_z_max",             default_value="130.0"),      # grasp 진입 허용 최대 TCP Z (mm)
         DeclareLaunchArgument("min_hold_frames",         default_value="16"),         # phase 최소 유지 프레임 (빠른 사이클 방지)
-        DeclareLaunchArgument("vacuum_check_enabled",        default_value="false"),
+        DeclareLaunchArgument("vacuum_check_enabled",        default_value="true"),
         DeclareLaunchArgument("vacuum_check_z",              default_value="85.0"),
         DeclareLaunchArgument("vacuum_timeout_sec",          default_value="1.0"),
         DeclareLaunchArgument("place_force_release_enabled", default_value="true"),
@@ -72,6 +73,30 @@ def generate_launch_description():
         DeclareLaunchArgument("scripted_lift_wait_frames",   default_value="48"),     # stall 판정 대기 프레임 (3초@16Hz)
         DeclareLaunchArgument("scripted_lift_stall_z",       default_value="160.0"),  # 이 Z 미달 시 stall
         DeclareLaunchArgument("scripted_lift_dz_thresh",     default_value="0.3"),    # mm/frame 이하 시 stall
+        DeclareLaunchArgument("scripted_return_enabled",     default_value="true"),   # release stall 시 강제 상승
+        DeclareLaunchArgument("scripted_return_target_z",    default_value="200.0"),  # 강제 상승 목표 Z (mm)
+        DeclareLaunchArgument("scripted_return_wait_frames", default_value="16"),     # 1초@16Hz 대기
+        DeclareLaunchArgument("scripted_return_stall_z",     default_value="150.0"),  # 이 Z 미달 시 stall
+
+        # ── Context Agent 인자 (2×2 ablation용) ─────────────────────────────────
+        DeclareLaunchArgument("use_context_agent",      default_value="false"),   # true=context_agent_node, false=task_node
+        DeclareLaunchArgument("context_agent_api_key",  default_value=""),        # 미설정 시 ANTHROPIC_API_KEY 환경변수
+        DeclareLaunchArgument("context_agent_model",    default_value="claude-haiku-4-5-20251001"),
+
+        # ── MPC-lite 인자 (2×2 ablation용) ──────────────────────────────────
+        DeclareLaunchArgument("use_mpc_lite",           default_value="false"),   # 1-step lookahead smoothing
+        DeclareLaunchArgument("mpc_alpha",              default_value="0.7"),     # EMA weight (현재 step 비중)
+
+        # ── QP-MPC v1 인자 (3-way ablation 3번째 arm) ───────────────────────
+        # use_mpc=false면 기존 동작 그대로. true면 chunk-level receding-horizon QP optimizer.
+        DeclareLaunchArgument("use_mpc",                default_value="false"),
+        DeclareLaunchArgument("mpc_horizon",            default_value="0"),       # 0 → steps_per_inference
+        DeclareLaunchArgument("mpc_w_track",            default_value="1.0"),
+        DeclareLaunchArgument("mpc_w_vel",              default_value="0.1"),
+        DeclareLaunchArgument("mpc_w_acc",              default_value="0.05"),
+        DeclareLaunchArgument("mpc_w_jerk",             default_value="0.02"),
+        DeclareLaunchArgument("mpc_backend",            default_value="scipy"),   # scipy | osqp
+        DeclareLaunchArgument("mpc_a_max",              default_value="2.0"),     # deg/step^2 (hard_accel용)
 
         # ── 음성 명령 인자 ─────────────────────────────────────────────────────
         DeclareLaunchArgument("use_voice",              default_value="false"),   # voice_command_node 활성화
@@ -93,6 +118,10 @@ def generate_launch_description():
                 "dry_run":   LaunchConfiguration("dry_run"),
                 "no_camera": LaunchConfiguration("no_camera"),
             }],
+            additional_env={
+                "PYTHONPATH": "/home/billye6/E6-VLA_INFERENCE/hardware/dobot"
+                              + (":" + os.environ["PYTHONPATH"] if os.environ.get("PYTHONPATH") else ""),
+            },
         ),
 
         # ── 노드 2: inference_bridge_node ──────────────────────────────────
@@ -104,6 +133,7 @@ def generate_launch_description():
             parameters=[{
                 "server_host":       LaunchConfiguration("server_host"),
                 "server_port":       LaunchConfiguration("server_port"),
+                "infer_hz":          LaunchConfiguration("infer_hz"),
                 "save_debug_images": LaunchConfiguration("save_debug_images"),
                 "action_mode":       LaunchConfiguration("action_mode"),
             }],
@@ -150,14 +180,32 @@ def generate_launch_description():
                 "scripted_lift_wait_frames":   LaunchConfiguration("scripted_lift_wait_frames"),
                 "scripted_lift_stall_z":       LaunchConfiguration("scripted_lift_stall_z"),
                 "scripted_lift_dz_thresh":     LaunchConfiguration("scripted_lift_dz_thresh"),
+                "scripted_return_enabled":     LaunchConfiguration("scripted_return_enabled"),
+                "scripted_return_target_z":    LaunchConfiguration("scripted_return_target_z"),
+                "scripted_return_wait_frames": LaunchConfiguration("scripted_return_wait_frames"),
+                "scripted_return_stall_z":     LaunchConfiguration("scripted_return_stall_z"),
+                "use_mpc_lite":                LaunchConfiguration("use_mpc_lite"),
+                "mpc_alpha":                   LaunchConfiguration("mpc_alpha"),
+                "use_mpc":                     LaunchConfiguration("use_mpc"),
+                "mpc_horizon":                 LaunchConfiguration("mpc_horizon"),
+                "mpc_w_track":                 LaunchConfiguration("mpc_w_track"),
+                "mpc_w_vel":                   LaunchConfiguration("mpc_w_vel"),
+                "mpc_w_acc":                   LaunchConfiguration("mpc_w_acc"),
+                "mpc_w_jerk":                  LaunchConfiguration("mpc_w_jerk"),
+                "mpc_backend":                 LaunchConfiguration("mpc_backend"),
+                "mpc_a_max":                   LaunchConfiguration("mpc_a_max"),
                 "max_steps":                   LaunchConfiguration("max_steps"),
                 "min_steps":                   LaunchConfiguration("min_steps"),
                 "home_tol_deg":                LaunchConfiguration("home_tol_deg"),
                 "home_consec_req":             LaunchConfiguration("home_consec_req"),
             }],
+            additional_env={
+                "PYTHONPATH": "/home/billye6/E6-VLA_INFERENCE/hardware/dobot"
+                              + (":" + os.environ["PYTHONPATH"] if os.environ.get("PYTHONPATH") else ""),
+            },
         ),
 
-        # ── 노드 4: task_node ──────────────────────────────────────────────
+        # ── 노드 4a: task_node (use_context_agent:=false 일 때만 실행, baseline) ─
         Node(
             package="e6_vla_ros",
             executable="task_node",
@@ -177,6 +225,25 @@ def generate_launch_description():
                 "min_hold_frames":   LaunchConfiguration("min_hold_frames"),
                 "pick_prearm_z":     LaunchConfiguration("pick_prearm_z"),
             }],
+            condition=UnlessCondition(LaunchConfiguration("use_context_agent")),
+        ),
+
+        # ── 노드 4b: context_agent_node (use_context_agent:=true 일 때만 실행) ─
+        Node(
+            package="e6_vla_ros",
+            executable="context_agent_node",
+            name="context_agent_node",
+            output="screen",
+            parameters=[{
+                "source_side":        LaunchConfiguration("source_side"),
+                "target_side":        LaunchConfiguration("target_side"),
+                "grasp_z_max":        LaunchConfiguration("grasp_z_max"),
+                "min_hold_frames":    LaunchConfiguration("min_hold_frames"),
+                "pick_prearm_z":      LaunchConfiguration("pick_prearm_z"),
+                "anthropic_api_key":  LaunchConfiguration("context_agent_api_key"),
+                "agent_model":        LaunchConfiguration("context_agent_model"),
+            }],
+            condition=IfCondition(LaunchConfiguration("use_context_agent")),
         ),
 
         # ── 노드 5-b: e6_visualization_node ──────────────────────────────────
