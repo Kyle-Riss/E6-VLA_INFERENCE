@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -52,7 +53,7 @@ class InferenceBridgeNode(Node):
         # 파라미터
         self.declare_parameter("server_host", "127.0.0.1")
         self.declare_parameter("server_port", 8000)
-        self.declare_parameter("infer_hz", 1.25)
+        self.declare_parameter("infer_hz", 2.0)
         self.declare_parameter("save_debug_images", False)
         self.declare_parameter("action_mode", "absolute")  # "absolute" (v6) | "delta" (v8)
 
@@ -78,7 +79,6 @@ class InferenceBridgeNode(Node):
         self._inference_running = False
         self._task_complete = False
         self._executor = ThreadPoolExecutor(max_workers=1)
-        self._prev_actions: np.ndarray | None = None  # temporal ensembling용
 
         # 구독
         self.create_subscription(Image,             "/e6/camera/image",     self._cb_img,     10)
@@ -220,13 +220,13 @@ class InferenceBridgeNode(Node):
         try:
             self._infer_call_count += 1
             self._infer_count_pub.publish(Int32(data=self._infer_call_count))
+            _t0 = time.monotonic()
             result = self._policy.infer(obs)
+            _infer_ms = (time.monotonic() - _t0) * 1000.0
             actions = np.asarray(result["actions"], dtype=np.float32)  # (16, 7)
             state = obs["observation/state"]
-            delta0  = actions[0,  :6] - state[:6]
-            delta15 = actions[15, :6] - state[:6]
             self.get_logger().info(
-                f"추론 완료 shape={actions.shape} "
+                f"추론 완료 shape={actions.shape} latency={_infer_ms:.0f}ms "
                 f"prompt={obs['prompt']!r}"
             )
             grip_vals = [f"{actions[i,6]:+.3f}" for i in range(len(actions))]
@@ -234,13 +234,26 @@ class InferenceBridgeNode(Node):
             self.get_logger().info(f"action[0]:  {np.round(actions[0,:6],1).tolist()}  grip={actions[0,6]:+.3f}")
             self.get_logger().info(f"action[15]: {np.round(actions[15,:6],1).tolist()}  grip={actions[15,6]:+.3f}")
             self.get_logger().info(f"grip_seq:   {grip_vals}")
-            self.get_logger().info(
-                f"delta[0]:  {['%+.1f'%d for d in delta0]}  max={np.abs(delta0).max():.1f}°"
-            )
-            self.get_logger().info(
-                f"delta[15]: {['%+.1f'%d for d in delta15]}  max={np.abs(delta15).max():.1f}°"
-            )
-            max_delta0 = np.abs(delta0).max()
+            if self._action_mode == "delta":
+                # delta mode: action 자체가 delta (deg/frame)
+                self.get_logger().info(
+                    f"delta[0]:  {np.round(actions[0,:6],2).tolist()}  max={np.abs(actions[0,:6]).max():.2f}°"
+                )
+                self.get_logger().info(
+                    f"delta[15]: {np.round(actions[15,:6],2).tolist()}  max={np.abs(actions[15,:6]).max():.2f}°"
+                )
+                max_delta0 = np.abs(actions[0, :6]).max()
+            else:
+                # absolute mode: action - state = 이동 거리
+                delta0  = actions[0,  :6] - state[:6]
+                delta15 = actions[15, :6] - state[:6]
+                self.get_logger().info(
+                    f"delta[0]:  {['%+.1f'%d for d in delta0]}  max={np.abs(delta0).max():.1f}°"
+                )
+                self.get_logger().info(
+                    f"delta[15]: {['%+.1f'%d for d in delta15]}  max={np.abs(delta15).max():.1f}°"
+                )
+                max_delta0 = np.abs(delta0).max()
             # J5 부호 반전 = mode flip → reject (absolute mode 전용)
             # delta mode에서는 act_j5가 속도값이므로 부호 체크 불필요
             if self._action_mode == "absolute":
