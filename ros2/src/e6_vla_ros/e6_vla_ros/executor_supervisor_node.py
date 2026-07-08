@@ -175,7 +175,8 @@ class ExecutorSupervisorNode(Node):
         self.declare_parameter("mpc_w_acc", 0.05)
         self.declare_parameter("mpc_w_jerk", 0.02)
         self.declare_parameter("mpc_backend", "scipy")  # "scipy"(기본) | "osqp"
-        self.declare_parameter("mpc_a_max", 2.0)        # deg/step^2 (hard_accel 옵션용; 기본 soft)
+        self.declare_parameter("mpc_a_max", 2.0)        # deg/step^2 (hard_accel 시 가속 상한)
+        self.declare_parameter("mpc_hard_accel", False) # True면 가속 |Δ²q|≤a_max·dt² hard 제약 추가(기본 soft)
 
         self._dry_run = self.get_parameter("dry_run").value
         self._no_camera = self.get_parameter("no_camera").value
@@ -232,7 +233,18 @@ class ExecutorSupervisorNode(Node):
         self._mpc_w_acc    = float(self.get_parameter("mpc_w_acc").value)
         self._mpc_w_jerk   = float(self.get_parameter("mpc_w_jerk").value)
         self._mpc_a_max    = float(self.get_parameter("mpc_a_max").value)
+        self._mpc_hard_accel = bool(self.get_parameter("mpc_hard_accel").value)
         self._executor_hz  = _executor_hz   # MPC dt 계산용 (helper에서 사용)
+
+        # ── invalid mode guard: use_mpc(QP)와 use_mpc_lite(EMA)는 상호배타 → QP 우선 ──
+        if self._use_mpc and self._use_mpc_lite:
+            self.get_logger().warn(
+                "use_mpc=true와 use_mpc_lite=true 동시 지정 → QP(use_mpc) 우선, "
+                "use_mpc_lite 비활성화"
+            )
+            self._use_mpc_lite = False
+        self._resolved_mode = ("qp_mpc" if self._use_mpc
+                               else ("lookahead" if self._use_mpc_lite else "safety_clamp"))
 
         # URDF 관절 위치 한계 (degree)
         self._joint_min_deg, self._joint_max_deg = _load_joint_limits_deg()
@@ -258,15 +270,22 @@ class ExecutorSupervisorNode(Node):
                 w_acc=self._mpc_w_acc, w_jerk=self._mpc_w_jerk,
                 q_min=self._joint_min_deg, q_max=self._joint_max_deg,
                 dq_max=self._max_delta, a_max=self._mpc_a_max,
+                hard_accel=self._mpc_hard_accel,
                 action_scale=1.0,   # action_scale은 executor에서 pre-multiply (L514 의미 유지)
                 backend=self._mpc_backend, phase_weights=DEFAULT_PHASE_WEIGHTS,
                 logger=self.get_logger())
             self.get_logger().info(
                 f"[MPC] QP optimizer ON — backend={self._smoother.backend} "
                 f"horizon={self._mpc_horizon} w=(t{self._mpc_w_track},v{self._mpc_w_vel},"
-                f"a{self._mpc_w_acc},j{self._mpc_w_jerk}) dq_max={self._max_delta}"
+                f"a{self._mpc_w_acc},j{self._mpc_w_jerk}) dq_max={self._max_delta} "
+                f"hard_accel={self._mpc_hard_accel} a_max={self._mpc_a_max}"
             )
         self._qp_clamp_hits = 0   # post-QP 안전클램프가 값을 바꾼 step 수 (QP 정상이면 ≈0)
+        # solver/fallback 누적 카운터 (16Hz 파일쓰기 금지 — 메모리 누적, metrics에서 1회 요약)
+        self._qp_solve_cnt = 0    # solve 시도 수
+        self._qp_fail_cnt = 0     # passthrough(fallback) 발생 수 (≈0이어야 arm 무오염)
+        self._qp_ms_sum = 0.0     # solve 소요 누적(ms)
+        self._qp_ms_max = 0.0     # solve 소요 최대(ms)
 
         # 로봇 상태 (camera_state_node에서 구독)
         self._current_deg = np.zeros(6, dtype=np.float32)
@@ -384,6 +403,7 @@ class ExecutorSupervisorNode(Node):
         self.get_logger().info(
             f"executor_supervisor_node 시작 — "
             f"robot={'연결됨' if self._dashboard else 'dry_run'} "
+            f"mode={self._resolved_mode} "
             f"control_mode={self._control_mode} "
             f"executor_hz={_executor_hz} max_delta={self._max_delta}° "
             f"min_tool_z={self._min_tool_z}mm steps_per_inference={self._steps_per_inference}/{ACTION_HORIZON}"
@@ -457,17 +477,26 @@ class ExecutorSupervisorNode(Node):
         v0_per_step = (self._current_vel if self._have_qd else self._finite_diff_vel()) * dt
         deltas = chunk[:, :6] * self._action_scale   # action_scale pre-multiply
         t0 = time.monotonic()
+        self._qp_solve_cnt += 1
         try:
             sm = self._smoother.solve(
                 chunk_deltas=deltas, anchor_deg=anchor,
                 v0=v0_per_step, a0=None, phase=self._current_stage,
                 gripper_seq=chunk[:, 6], absolute=(self._action_mode != "delta"))
         except Exception as exc:
+            self._qp_fail_cnt += 1   # 외부예외도 fallback(raw 경로)로 집계
             self.get_logger().warn(f"[MPC] solve 외부예외: {exc}")
             return None
+        # solve 상태 누적 (passthrough=fallback 감지 → arm 오염 방지)
+        _ms = float(getattr(self._smoother, "last_solve_ms", (time.monotonic() - t0) * 1000.0))
+        self._qp_ms_sum += _ms
+        self._qp_ms_max = max(self._qp_ms_max, _ms)
+        if not getattr(self._smoother, "last_solve_ok", True):
+            self._qp_fail_cnt += 1
         self.get_logger().info(
-            f"[MPC] solve {(time.monotonic()-t0)*1000:.1f}ms phase={self._current_stage} "
-            f"backend={self._smoother.backend} have_qd={self._have_qd}",
+            f"[MPC] solve {_ms:.1f}ms phase={self._current_stage} "
+            f"backend={self._smoother.backend} have_qd={self._have_qd} "
+            f"status={getattr(self._smoother, 'last_status', '?')}",
             throttle_duration_sec=2.0,
         )
         # 절대 target → per-step 증분으로 변환 (incremental 실행)
@@ -987,7 +1016,10 @@ class ExecutorSupervisorNode(Node):
                 "=" * 50,
                 f"[Inference Metrics]",
                 f"  arm                 : {_arm}",
+                f"  resolved_mode       : {self._resolved_mode}",
                 f"  mpc_backend         : {self._smoother.backend if self._use_mpc and self._smoother else '-'}",
+                f"  mpc_hard_accel      : {self._mpc_hard_accel if self._use_mpc else '-'}"
+                + (f" (a_max={self._mpc_a_max})" if self._use_mpc and self._mpc_hard_accel else ""),
                 f"  control_mode        : {self._control_mode}",
                 f"  suction ON 시각     : {suction_on_str}",
                 f"  이동 시작 → ON 시간 : {elapsed:.2f} 초",
@@ -1022,6 +1054,13 @@ class ExecutorSupervisorNode(Node):
                 ]
             if self._use_mpc:
                 lines.append(f"  post-QP clamp hits  : {self._qp_clamp_hits} (QP 정상이면 ≈0)")
+                _ms_mean = (self._qp_ms_sum / self._qp_solve_cnt) if self._qp_solve_cnt else 0.0
+                lines.append(
+                    f"  QP solve            : cnt={self._qp_solve_cnt} "
+                    f"fallback={self._qp_fail_cnt} "
+                    f"(fallback>0이면 arm 오염!) "
+                    f"ms mean={_ms_mean:.1f} max={self._qp_ms_max:.1f}"
+                )
             # B. End-Effector TCP position at suction ON
             tcp = self._current_tcp
             lines.append(

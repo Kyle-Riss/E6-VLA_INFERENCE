@@ -97,6 +97,7 @@ def generate_launch_description():
         DeclareLaunchArgument("mpc_w_jerk",             default_value="0.02"),
         DeclareLaunchArgument("mpc_backend",            default_value="scipy"),   # scipy | osqp
         DeclareLaunchArgument("mpc_a_max",              default_value="2.0"),     # deg/step^2 (hard_accel용)
+        DeclareLaunchArgument("mpc_hard_accel",         default_value="false"),   # true=가속 hard 제약(기본 soft)
 
         # ── 음성 명령 인자 ─────────────────────────────────────────────────────
         DeclareLaunchArgument("use_voice",              default_value="false"),   # voice_command_node 활성화
@@ -194,6 +195,7 @@ def generate_launch_description():
                 "mpc_w_jerk":                  LaunchConfiguration("mpc_w_jerk"),
                 "mpc_backend":                 LaunchConfiguration("mpc_backend"),
                 "mpc_a_max":                   LaunchConfiguration("mpc_a_max"),
+                "mpc_hard_accel":              LaunchConfiguration("mpc_hard_accel"),
                 "max_steps":                   LaunchConfiguration("max_steps"),
                 "min_steps":                   LaunchConfiguration("min_steps"),
                 "home_tol_deg":                LaunchConfiguration("home_tol_deg"),

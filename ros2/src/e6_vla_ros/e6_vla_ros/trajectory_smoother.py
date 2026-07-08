@@ -23,6 +23,8 @@ trajectory optimization (kinematic)". 3-way ablation의 `π0.5 + QP execution op
 """
 from __future__ import annotations
 
+import time
+
 import numpy as np
 
 try:
@@ -123,6 +125,13 @@ class MPCSmoother:
 
         self._warm_x = None             # scipy warm-start 상태 (6N,)
 
+        # ── solve 상태 노출 (호출부 fallback 감지용; 반환값과 무관) ────────────
+        # solve()가 성공/실패(passthrough) 모두 (N,6)을 반환하므로 호출부가 구분 불가.
+        # 아래 멤버로 마지막 solve의 성공여부/소요시간/상태문자열을 노출한다.
+        self.last_solve_ok = False      # True=최적해, False=passthrough(reference)
+        self.last_solve_ms = 0.0        # 마지막 solve 소요(ms)
+        self.last_status = ""           # "solved" | "passthrough:<exc>"
+
     # ── 로깅 헬퍼 ──────────────────────────────────────────────────────────────
     def _warn(self, msg: str):
         if self._log is not None:
@@ -188,6 +197,7 @@ class MPCSmoother:
         if gripper_seq is None and chunk_deltas.shape[1] > 6:
             gripper_seq = np.asarray(chunk_deltas, np.float64)[:N, 6]
 
+        _t0 = time.monotonic()
         try:
             wt_v, wv_v, wa_v, wj_v = self._step_weights(gripper_seq, phase)
             Pb = self._build_Pblock(wt_v, wv_v, wa_v, wj_v)          # (N,N) 관절 공통
@@ -236,8 +246,14 @@ class MPCSmoother:
             # 최종 안전: reference 근처를 벗어난 NaN/inf 방어
             if not np.all(np.isfinite(sm)):
                 raise ValueError("solver 결과에 비유한값")
+            self.last_solve_ok = True
+            self.last_status = "solved"
+            self.last_solve_ms = (time.monotonic() - _t0) * 1000.0
             return sm.astype(np.float32)
         except Exception as exc:
+            self.last_solve_ok = False
+            self.last_status = f"passthrough:{exc}"
+            self.last_solve_ms = (time.monotonic() - _t0) * 1000.0
             self._warn(f"solve 실패({exc}) → reference passthrough")
             return q_ref.astype(np.float32)
 
