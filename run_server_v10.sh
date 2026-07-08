@@ -12,14 +12,14 @@
 #    bash run_server_v10.sh [체크포인트경로]
 #
 #  예시 (HDD에 복사된 경우):
-#    bash run_server_v10.sh "/media/billye6/새 볼륨/e6_checkpoints/e6_v10_50k"
+#    bash run_server_v10.sh "/media/billye6/새 볼륨1/e6_checkpoints/e6_v10_50k"
 #
 #  체크포인트 경로 생략 시 기본값 사용.
 # ══════════════════════════════════════════════════════════════════════════════
 
 set -e
 
-DEFAULT_CKPT="/media/billye6/새 볼륨/e6_checkpoints/e6_v10_50k"
+DEFAULT_CKPT="/media/billye6/새 볼륨1/e6_checkpoints/e6_v10_50k"
 CHECKPOINT_DIR="${1:-$DEFAULT_CKPT}"
 
 if [ ! -d "$CHECKPOINT_DIR" ]; then
@@ -33,7 +33,8 @@ source ~/move-one/min-imum/move-one/bin/activate
 
 export MVCAM_COMMON_RUNENV=/opt/MVS/lib
 export PYTHONPATH="$REPO/src:$PYTHONPATH"
-export LD_LIBRARY_PATH="$HOME/DobotControl/min-imum/move-one/lib/python3.10/site-packages/nvidia/cusparselt/lib:$LD_LIBRARY_PATH"
+_NV="$HOME/move-one/min-imum/move-one/lib/python3.10/site-packages/nvidia"
+export LD_LIBRARY_PATH="$_NV/cusparselt/lib:$_NV/nccl/lib:$_NV/nvshmem/lib:$_NV/cu12/lib:$LD_LIBRARY_PATH"
 export TORCHDYNAMO_DISABLE=1
 
 echo "=============================="

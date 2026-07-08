@@ -2,7 +2,7 @@
 # ══════════════════════════════════════════════════════════════════════════════
 #  v12 정책 서버 실행 스크립트
 #
-#  체크포인트: /media/billye6/새 볼륨/e6_checkpoints/e6_v12_30k
+#  체크포인트: /media/billye6/새 볼륨1/e6_checkpoints/e6_v12_30k
 #  action expert: gemma_300m_lora_r16 (rank=16, scope 전체 18 layer)
 #  norm stats: Kyle-Riss/dobot_e6_pick_place_orange_v10 (gripper 패치 적용 완료)
 #
@@ -14,7 +14,7 @@
 
 set -e
 
-DEFAULT_CKPT="/media/billye6/새 볼륨/e6_checkpoints/e6_v12_30k"
+DEFAULT_CKPT="/media/billye6/새 볼륨1/e6_checkpoints/e6_v12_30k"
 CHECKPOINT_DIR="${1:-$DEFAULT_CKPT}"
 
 if [ ! -d "$CHECKPOINT_DIR" ]; then
@@ -28,7 +28,8 @@ source ~/move-one/min-imum/move-one/bin/activate
 
 export MVCAM_COMMON_RUNENV=/opt/MVS/lib
 export PYTHONPATH="$REPO/src:$PYTHONPATH"
-export LD_LIBRARY_PATH="$HOME/DobotControl/min-imum/move-one/lib/python3.10/site-packages/nvidia/cusparselt/lib:$LD_LIBRARY_PATH"
+_NV="$HOME/move-one/min-imum/move-one/lib/python3.10/site-packages/nvidia"
+export LD_LIBRARY_PATH="$_NV/cusparselt/lib:$_NV/nccl/lib:$_NV/nvshmem/lib:$_NV/cu12/lib:$LD_LIBRARY_PATH"
 export TORCHDYNAMO_DISABLE=1
 
 echo "=============================="

@@ -16,7 +16,7 @@
 set -e
 
 REPO="$(cd "$(dirname "$0")" && pwd)"
-DEFAULT_CKPT="/media/billye6/새 볼륨/e6_checkpoints/e6_v18_20k"
+DEFAULT_CKPT="/media/billye6/새 볼륨1/e6_checkpoints/e6_v18_20k"
 CHECKPOINT_DIR="${1:-$DEFAULT_CKPT}"
 
 if [ ! -d "$CHECKPOINT_DIR" ]; then
@@ -28,7 +28,8 @@ source ~/move-one/min-imum/move-one/bin/activate
 
 export MVCAM_COMMON_RUNENV=/opt/MVS/lib
 export PYTHONPATH="$REPO/src:$PYTHONPATH"
-export LD_LIBRARY_PATH="$HOME/DobotControl/min-imum/move-one/lib/python3.10/site-packages/nvidia/cusparselt/lib:$LD_LIBRARY_PATH"
+_NV="$HOME/move-one/min-imum/move-one/lib/python3.10/site-packages/nvidia"
+export LD_LIBRARY_PATH="$_NV/cusparselt/lib:$_NV/nccl/lib:$_NV/nvshmem/lib:$_NV/cu12/lib:$LD_LIBRARY_PATH"
 export TORCHDYNAMO_DISABLE=1
 
 echo "=============================="
