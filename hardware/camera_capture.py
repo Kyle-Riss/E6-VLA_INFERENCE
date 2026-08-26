@@ -26,6 +26,7 @@ class CameraCapture:
         self._cam = None
         self._use_cv2 = False
         self._last_frame = None
+        self._raw640: "np.ndarray | None" = None  # get_raw640() 캐시
         self._name = "none"
 
         if use_hikrobot and self._init_hikrobot():
@@ -250,6 +251,7 @@ class CameraCapture:
             # 학습 수집(robot_server.py)과 동일한 전처리
             # Native → 640×480 → 320×240 → crop[16:240, 55:279] → 224×224
             img = cv2.resize(img, (640, 480), interpolation=cv2.INTER_LINEAR)
+            self._raw640 = img.copy()  # SmolVLA용 원본 캐시
             img = cv2.resize(img, (320, 240), interpolation=cv2.INTER_LINEAR)
             img = img[16:240, 55:279]
             img = np.asarray(img, dtype=np.uint8)
@@ -259,6 +261,13 @@ class CameraCapture:
             if hasattr(self, "_last_frame") and self._last_frame is not None:
                 return self._last_frame
             return np.zeros((IMG_H, IMG_W, 3), dtype=np.uint8)
+
+    def get_raw640(self) -> "np.ndarray":
+        """640×480 RGB. get_frame() 호출 후 캐싱된 값 반환 (SmolVLA 전처리용)."""
+        import numpy as np
+        if self._raw640 is not None:
+            return self._raw640
+        return np.zeros((480, 640, 3), dtype=np.uint8)
 
     def close(self):
         if self._cam is None:

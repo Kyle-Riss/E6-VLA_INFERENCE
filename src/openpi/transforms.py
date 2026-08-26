@@ -111,11 +111,46 @@ class InjectDefaultPrompt(DataTransformFn):
         return data
 
 
+def quantile_bounds(q01, q99, floor_ratio: float | None):
+    """Offset and width for quantile normalization, with the width optionally floored.
+
+    Quantile normalization divides each dimension by its own (q99 - q01), so a dimension
+    whose values barely move is amplified in inverse proportion to that range. On an arm
+    with a mechanically constrained joint this hands most of the training signal to the
+    dimension that carries the least information.
+
+    `floor_ratio` bounds that amplification: no dimension is divided by less than the
+    median width over the non-degenerate dimensions divided by `floor_ratio`. A ratio of
+    4.0 therefore allows a dimension at most 4x the amplification of the median one, and
+    the ratio *is* the cap — a floored dimension ends up at exactly `floor_ratio`x.
+
+    Widening has to keep the distribution centred. Holding the lower anchor fixed and
+    only stretching the width would slide the data toward -1 and hand the model a
+    constant offset to learn, which is a second problem rather than a fix. The width
+    therefore grows symmetrically about (q01 + q99) / 2.
+
+    Returns (offset, width) to feed the unchanged normalization formula, so passing
+    None reproduces the original behaviour bit-for-bit.
+    """
+    width = q99 - q01
+    if floor_ratio is None:
+        return q01, width
+    positive = width[width > 0]
+    if positive.size == 0:
+        return q01, width
+    widened = np.maximum(width, float(np.median(positive)) / floor_ratio)
+    centre = (q01 + q99) / 2.0
+    return centre - widened / 2.0, widened
+
+
 @dataclasses.dataclass(frozen=True)
 class Normalize(DataTransformFn):
     norm_stats: at.PyTree[NormStats] | None
     # If true, will use quantile normalization. Otherwise, normal z-score normalization will be used.
     use_quantiles: bool = False
+    # Caps how much more a dimension can be amplified than the median dimension. See `quantile_bounds`.
+    # None keeps the unmodified quantile rule. Only used when `use_quantiles` is true.
+    quantile_range_floor: float | None = None
     # If true, will raise an error if any of the keys in the norm stats are not present in the data.
     strict: bool = False
 
@@ -141,8 +176,11 @@ class Normalize(DataTransformFn):
     def _normalize_quantile(self, x, stats: NormStats):
         assert stats.q01 is not None
         assert stats.q99 is not None
-        q01, q99 = stats.q01[..., : x.shape[-1]], stats.q99[..., : x.shape[-1]]
-        return (x - q01) / (q99 - q01 + 1e-6) * 2.0 - 1.0
+        # The floor is taken over the full stat vector, not the slice, so that padding the
+        # action dimension does not move it.
+        offset, width = quantile_bounds(stats.q01, stats.q99, self.quantile_range_floor)
+        offset, width = offset[..., : x.shape[-1]], width[..., : x.shape[-1]]
+        return (x - offset) / (width + 1e-6) * 2.0 - 1.0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -150,6 +188,8 @@ class Unnormalize(DataTransformFn):
     norm_stats: at.PyTree[NormStats] | None
     # If true, will use quantile normalization. Otherwise, normal z-score normalization will be used.
     use_quantiles: bool = False
+    # Must match the value given to `Normalize` for the pair to invert. See `quantile_bounds`.
+    quantile_range_floor: float | None = None
 
     def __post_init__(self):
         if self.norm_stats is not None and self.use_quantiles:
@@ -175,10 +215,10 @@ class Unnormalize(DataTransformFn):
     def _unnormalize_quantile(self, x, stats: NormStats):
         assert stats.q01 is not None
         assert stats.q99 is not None
-        q01, q99 = stats.q01, stats.q99
-        if (dim := q01.shape[-1]) < x.shape[-1]:
-            return np.concatenate([(x[..., :dim] + 1.0) / 2.0 * (q99 - q01 + 1e-6) + q01, x[..., dim:]], axis=-1)
-        return (x + 1.0) / 2.0 * (q99 - q01 + 1e-6) + q01
+        offset, width = quantile_bounds(stats.q01, stats.q99, self.quantile_range_floor)
+        if (dim := offset.shape[-1]) < x.shape[-1]:
+            return np.concatenate([(x[..., :dim] + 1.0) / 2.0 * (width + 1e-6) + offset, x[..., dim:]], axis=-1)
+        return (x + 1.0) / 2.0 * (width + 1e-6) + offset
 
 
 @dataclasses.dataclass(frozen=True)
@@ -308,16 +348,33 @@ class ExtractFASTActions(DataTransformFn):
 
 @dataclasses.dataclass(frozen=True)
 class PromptFromLeRobotTask(DataTransformFn):
-    """Extracts a prompt from the current LeRobot dataset task."""
+    """Extracts a prompt from the current LeRobot dataset task.
+
+    When task_group_map is provided, the stored task_index is treated as a group
+    key and one member is chosen at random each training step — matching DROID's
+    per-step language augmentation.  Example:
+        task_group_map={0: [0, 1, 2], 3: [3, 4, 5]}
+    means task_index 0 (left→right anchor) randomly resolves to task 0, 1, or 2
+    each time the sample is drawn, and task_index 3 (right→left anchor) resolves
+    to task 3, 4, or 5.  For datasets without groups, leave as None (default).
+    """
 
     # Contains the LeRobot dataset tasks (dataset.meta.tasks).
     tasks: dict[int, str]
+    # Optional direction→variant group map for per-step language augmentation.
+    task_group_map: dict[int, tuple[int, ...]] | None = None
 
     def __call__(self, data: DataDict) -> DataDict:
+        import random
+
         if "task_index" not in data:
             raise ValueError('Cannot extract prompt without "task_index"')
 
         task_index = int(data["task_index"])
+
+        if self.task_group_map is not None and task_index in self.task_group_map:
+            task_index = random.choice(self.task_group_map[task_index])
+
         if (prompt := self.tasks.get(task_index)) is None:
             raise ValueError(f"{task_index=} not found in task mapping: {self.tasks}")
 

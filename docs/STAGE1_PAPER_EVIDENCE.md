@@ -28,6 +28,91 @@ Stage 1 연구 질문 (공개 사이트 `research.html` 기준):
 
 ---
 
+## 0.5 기여 요약 — "무엇을 밝혔는가" (2026-08-11 신설)
+
+> 이 문서는 원래 Tier(A/B/C)별로만 정렬돼 있어 **읽어도 무엇을 밝혔는지 보이지 않았다.**
+> 아래는 같은 근거를 **기여 단위**로 다시 묶은 색인이다. 각 항목은 상세 절을 가리킨다.
+> 순서는 논문 서술 순서(시스템 → 측정 → 발견 → 감사)를 따른다.
+> ⚠️ 범위는 **E6/π0.5 전용**이다. xArm(Stage 2A)·SmolVLA는 이 문서에 넣지 않는다.
+
+### I. 만든 것 — 작동하는 시스템 (1차 기여)
+
+로보틱스에서 돌아가는 시스템은 그 자체가 결과다. 아래 III의 발견 3개는 전부
+**이 시스템을 실기로 돌리다 실패한 지점**에서 나왔으므로, I 없이는 III가 존재할 수 없다.
+
+| # | 만든 것 | 근거 |
+|---|---|---|
+| **I-1** | **per-frame 6-phase prompting** — 에피소드 단위 프롬프트(v2)는 실기 실패, per-frame phase(v16~v23)는 작동. π0.5는 히스토리가 없어 관측만으로 "넣는 중"과 "빼는 중"을 구분 못 하는데 그것을 **언어로** 해결했다 | `task_node.py:44-61` `V16_PHASE_PROMPTS` + 실기 실적 |
+| **I-2** | **5노드 분리와 그 근거** — "기능마다 노드"가 아니라 **I/O 경계와 주기마다 노드, 순수 함수는 모듈** | §5 |
+| **I-3** | **Rule-Based Constrained Execution Layer** — 속도 클램프 + URDF 관절 절대 리밋 자동 파싱 + Z 가드 + scripted lift + 강제 릴리즈 백스톱. 외부에서 "MPC"라 부른 것을 구현에 맞게 **용어 교정** | `executor_supervisor_node.py` |
+| **I-4** | **efference-copy gripper state** — DigitalOutputs가 그리퍼 상태를 주지 않으므로 executor가 명령 시 `/e6/gripper/commanded`를 발행하고 PhaseTracker가 구독 | `executor_supervisor_node.py:411` → `camera_state_node.py:104` |
+
+⚠️ **I-4가 III-1의 원인이다.** 하드웨어 제약을 우회한 설계가 phase 검출을 사후적으로 만들었다.
+설계 선택이 나중에 실패 모드가 된 사례로 본문에 그대로 쓸 수 있다.
+
+### II. 잰 것 — 정량 특성 (전부 이 Jetson, Tier A)
+
+| 측정 | 값 | n | 절 |
+|---|---|---|---|
+| 모델 forward (WebSocket 왕복) | **2087.9 ± 14.0 ms** | 10 | A-1 |
+| 모델 forward (in-process, ROS2 없음) | **2122.8 ± 28.5 ms** | 10 | A-1 |
+| **Executor tick** | **62.52 ± 0.07 ms** | 25 | A-2 |
+| Chunk 도착 간격 | 2500.96 ± 13.22 ms | 25 | A-2 · A-3 |
+| Cmd RTT (baseline) | 9.10 ± 1.01 ms | 19 | A-2 |
+| Tracking RMSE (baseline) | 0.324 ± 0.115° | 19 | A-2 |
+| ServoJ vs MovJ pick time | 36.5 ± 8.5 s vs 67.9 ± 2.4 s | 3 | B-1 |
+
+🔴 **가장 강한 한 쌍은 `2087.9 ms ↔ 62.52 ms`다**(§A-4). 두 측정이 **서로 다른 경로인데**
+2.09/2.12 s로 일치하므로 **비용은 직렬화가 아니라 forward 자체**이고, 그것이 62.5 ms tick과
+33배 차이라는 사실이 §5의 구조 전체를 정당화한다. 표 둘에 흩지 말고 한 문장 안에 병치할 것.
+
+### III. 밝혀낸 것 — 발견 3개
+
+**공통 형태: "X가 안 되는 건 모델 탓이라 믿었는데, 데이터·배포 파이프라인이었다."**
+셋 다 이 리그를 넘어 일반화된다.
+
+| # | 믿었던 것 | 실제 | 절 |
+|---|---|---|---|
+| **III-1** | 릴리즈가 안 된 건 프롬프트가 없었거나 프레임워크 제약 | 프롬프트는 **있었고 정확했다.** 학습 라벨은 그리퍼 이벤트를 **16프레임 앞당겨** 붙는데(198/198) 배포는 pick만 재현하고 release는 안 했다. 게다가 배포의 release는 **executor 자신의 명령**을 보고 켜지므로 **lead가 양수일 수 없는 인과 루프** | **A-6** |
+| **III-2** | 접근 각도가 안 변한 건 scripted lift 후 OOD | **가르친 적이 없다.** 흡착은 축대칭이라 J6는 접근각에 **0.0000°** 기여하고 J5가 마지막인데, 수집 자동화가 그것을 **Δj5 q01–q99 = 0.258°**로 붕괴시켰다. quantile 정규화가 그 죽은 축을 **~13배 증폭** | A-4b |
+| **III-3** | 마지막 레이어가 공간 정보를 덮어쓰니 끝단을 빼면 좋다(v17 설계 근거) | **끝점 무효 · 폭 무효 · 위치가 전부.** late 9층(65.2 s) ≈ all 27층(65.8 s) ≪ early(125.4)·mid(146.2). 이유는 **proprioception이 아예 없어**(`state_proj` 미생성 + `discrete_state_input=False`) **vision이 공간 정보의 유일한 출처**이기 때문 | A-5 |
+
+⇒ 일반화 문장 3개 (그대로 본문 후보):
+1. *Phase-conditioned VLA에서 학습 라벨은 미래를 당겨 쓰는데 배포 phase 검출기는 인과적이다.
+   로봇 자신의 행동으로 검출되는 phase는 원리적으로 재현 불가능하다.*
+2. *수집 자동화의 편의로 고정한 DOF가 축별 정규화를 거쳐 학습 그래디언트를 잠식한다.
+   데이터에 분산이 없으면 모델 문제가 아니다.*
+3. *Frozen VLM + LoRA에서 adaptation의 **폭**은 이득이 없고 **위치**가 전부다.
+   그 이유는 아키텍처가 공간 정보를 어디서 얻는지에 달려 있다.*
+
+### IV. 뒤집은 것 — 감사
+
+같은 기준을 **남의 것과 내 것에 함께** 적용했다는 것이 이 축의 내용이다.
+
+**IV-1. 이전 기록·외부 판정** — v22 "없음" → **존재**(range `(9,17)`) / v26 **복구**
+(`norm_stats.json`이 truncated PNG → v25 byte-identical 사본) / v20은 **orphan**
+(TrainConfig 정의도 run script도 없음 ⇒ `--policy.config` 해석 불가로 서빙 자체 불가) /
+**band ablation "원본 재현 불가"(2026-07-24 감사 결론) → `metrics_arm1.txt`에 있었다**(§0·§A-5) /
+layer 26 설계 근거 실기 무효(§B-4)
+
+🔴 **IV-1에서 가장 값어치 있는 것은 band ablation이다.** "데이터가 없다"로 종결된 실험이
+사실은 **파일 하나를 안 열어서**였고(감사 산출물 전체에서 `metrics_arm1` 참조 0건),
+찾으니 **Tier B → Tier A로 올라가며 논문 핵심 ablation이 근거를 얻었다.**
+ServoJ/MovJ 원본도 같은 파일에 있어 함께 승격됐다.
+
+**IV-2. 내 주장을 내가 뒤집은 것** — RMSE 0.35°(n=26)가 **arm 혼합**(→ baseline n=19,
+0.324 ± 0.115°) / n=26 → **25** / 2.5 s "합산" 설명 → **폴링 양자화**(§A-3) /
+j5 부호 규약 불일치 → **population mixing**(§A-4b) / "사이트 본문에 그 설명 없다" → **있었음**
+
+⚠️ RMSE와 j5는 **같은 실수(집단 혼합)를 하루 안에 두 번** 한 것이다.
+우연이 아니라 **실수 유형**이므로, 파생 통계를 인용할 때는 n을 새로 세지 말고
+**기존 게시값이 재현되는 집단을 찾아 맞출 것.**
+
+**IV-3. 근거로 쓸 뻔했다가 배제한 것** — §3 Tier C 참조
+(`approach_logs/` 타 머신 / `~/Desktop/figures/` 빈 그림 / 지연 최적화 3단계 표 검증 불가)
+
+---
+
 ## 1. Tier A — 원자료가 있고 재계산으로 검증한 것 (논문에 그대로 쓸 수 있음)
 
 ### A-1. 온디바이스 추론 비용 — 두 경로가 일치한다
@@ -120,6 +205,53 @@ steps_per_inference 8  ×  k 5 ticks  ×  62.5 ms  =  2500 ms      ← 도착 �
 이 절이 필요한 이유: Stage 1 의 질문이 "신뢰할 만한 궤적이 나오는가"인데, action chunking 이
 **왜 성립하는지**를 설명하지 못하면 그 신뢰성이 우연으로 읽힌다.
 
+### A-4b. ★ J5 저분산의 정체 — 수집 설계가 자세를 고정했다 (2026-08-09)
+
+학습서버가 정규화 쪽에서 본 **"j5 = loss 의 25.7 %"** 의 **원인**이 수집 코드와 데이터에 있다.
+
+**원인 — 자세 3축 고정**
+`dobot-xarm-datacollect/Dobot_E6_Moveit2/config/robot_config.json` 의 모든 pick/place 좌표가
+**`rx=180, ry=0, rz=0`** 이다. 툴이 항상 수직 아래를 보도록 자세를 완전히 고정한 태스크다.
+
+**결과 — 실제 수집 데이터** (`vla_dataset/vla_auto_2026012*/robot_data.csv`, 3 에피소드 450 프레임)
+
+| joint | mean | **std** | 범위폭 | \|Δ\| mean (action 라벨과 같은 양) |
+|---|---|---|---|---|
+| j1 | −81.6 | 8.24 | 28.4° | 0.470 |
+| j2 | −46.9 | **26.38** ← 최대 | 106.4° | 3.307 |
+| j3 | −43.7 | 14.06 | 61.9° | 0.948 |
+| j4 | +21.5 | 12.28 | 53.0° | 1.840 |
+| **j5** | **+90.2** | **4.46** ← **최소** | **21.2°** ← 최소 | **0.535** |
+| j6 | +97.7 | 10.10 | 47.8° | 0.528 |
+
+**j5 는 +90° 에 눌러앉아 "툴을 수직 아래로 유지하는" 기계적 상수 역할**을 하고, 나머지 5축이
+위치를 만든다. 태스크가 그렇게 설계돼 있으므로 j5 는 **움직일 이유가 없다.**
+
+**이것이 세 가지를 한 번에 설명한다**
+1. **quantile normalization 왜곡** — `use_quantile_norm = model_type != PI0`(`config.py:188`)라
+   축마다 자기 분위수로 정규화한다. j5 의 원본 Δ 분산이 작으니 **분모가 작아지고 노이즈가 다른
+   축과 같은 크기로 부풀려진다.** 실제 기여가 없는 축이 loss 의 1/4 을 먹는 구조다
+2. **`fig2` 에서 J5 tracking RMSE 가 유독 낮은 것**(ServoJ 0.14° vs 다른 축 0.37~0.48°) — 정확도가
+   좋은 게 아니라 **과제가 쉬운 것**이다. `paper_docx_prompt.md` 가 "J5 는 수직 방향 운동이 적어
+   기여가 낮다"고 이미 적었는데 **왜 그런지가 이제 수집 설계로 설명된다**
+3. **xArm 의 dj4 저분산과 같은 병** — 자세를 고정하면 손목 하나가 죽는다. E6 에서 실제로
+   일어났음이 확인된 셈이고, 이것이 xArm 에서 회전 텔레옵을 여는 이유가 된다
+
+⇒ 논문 문장: *the low variance of J5 is a property of the task design (fixed tool orientation),
+not of the policy; quantile normalization then amplifies its residual noise.*
+
+🔴 **CSV 의 `rx/ry/rz` 를 그대로 통계 내지 말 것**
+같은 파일에서 `rx mean 65.45 / std 158.46 / 범위 −180.0 ~ +180.0` 이 나오는데 자세가 흔들린 게
+아니라 **오일러각 wrap** 이다(`+179.99` 와 `−179.99` 는 같은 자세). 설정은 `rx=180` 고정이다.
+xArm 세션에도 같은 함정이 기록돼 있다("rx≈±180° 근처 특이점에서 축간 커플링, 수학적으로 정상").
+
+⚠️ **한계**: 이 데이터는 **2026-01-26 자동수집 3 에피소드**이고 학습에 쓴
+`2CAM-Orange-init` 549 에피소드가 아니다. 경향은 같을 가능성이 크지만 **학습 데이터로 재확인
+필요**(HDD 마운트 후). `|Δj5| max = 8.44°` 라 완전 고정은 아니고 미세 보정은 한다.
+
+⚠️ **FK 기반 IK 로 이걸 확인하려던 시도는 실패했다** — 관절 리밋을 걸지 않아 해가 여러 바퀴
+감긴 채 수렴했다(j3 범위 ±1400°). 실제 수집 데이터가 추정보다 강한 증거이므로 IK 결과는 쓰지 않는다.
+
 ### A-4. 논문에서 병치할 한 쌍
 
 > forward **2087.9 ± 14.0 ms** ↔ executor tick **62.52 ± 0.07 ms**
@@ -163,6 +295,66 @@ steps_per_inference 8  ×  k 5 ticks  ×  62.5 ms  =  2500 ms      ← 도착 �
 
 ⚠️ **`full` 라벨이 06-13·06-17 세션까지 삼킨다** — 순진하게 파싱하면 44개로 잡힌다.
 band 비교는 **05-29 의 5개만** 쓸 것.
+
+---
+
+### A-6. ★ release 라벨 타이밍 비대칭 — 배포가 재현할 수 없는 phase (2026-08-11 신규)
+
+**증상**: 실기에서 흡착 후 상승·횡이동·하강까지 되는데 **릴리즈가 안 됐다.**
+(처음엔 "옆으로 가라는 프롬프트를 안 줬거나 프레임워크 제약"으로 의심했으나
+`task_node.py:49` 에 `transport` 프롬프트가 **있고 정확하다** — 프롬프트는 원인이 아니다.)
+
+#### 학습 쪽 (학습서버 측정)
+
+| | 값 |
+|---|---|
+| 라벨 생성 | 규칙 생성 `release_start = max(carry_start, open_idx − ACTION_HORIZON)` |
+| lead | 그리퍼 open 전환보다 **+16 프레임 앞** |
+| 적용 범위 | **198/198 에피소드** (예외 없음) |
+
+⇒ 학습에서 `release` 프롬프트는 **그리퍼가 열리기 1초 전부터** 붙어 있다.
+
+#### 배포 쪽 (이 Jetson 소스, 전수 확인)
+
+| phase | 트리거 | lead |
+|---|---|---|
+| **pick** | `tcp_z <= pick_prearm_z` (기본 159.0) — Z 기반 **선진입** (`task_node.py:154`) | **양수** ✅ |
+| **release** | `_trans_counter > 0 and _trans_type == "open"` — 그리퍼 1→0 **전환 후** (`:151`) | **음수** ❌ |
+
+- 🔴 `task_node.py:154` 주석이 그대로 **`# Z 기반 미리 pick_up (학습 레이블 타이밍 맞춤)`** 이다.
+  ⇒ **비대칭이 pick에서는 인지되어 처리됐고 release에서는 안 됐다.** 몰라서가 아니라 빠뜨린 것이다.
+- `prearm` 전수 검색: `ros2/src/e6_vla_ros/` 전체 **9건이 모두 `pick_prearm_z`**,
+  `place_prearm_z` / `release_prearm_z` 는 **존재하지 않는다.**
+
+#### 🔴 파라미터로는 고칠 수 없다 — 인과 루프
+
+배포에서 그리퍼 상태는 **executor 자신이 낸 ToolDO 명령의 efference copy** 로 돌아온다:
+`executor_supervisor_node.py:411` → `/e6/gripper/commanded` → `camera_state_node.py:104`
+→ `state[6]` → PhaseTracker.
+따라서 `release` phase 는 **정의상 자기 명령보다 뒤**이며, 어떤 임계값을 주더라도 **lead ≤ 0** 이다.
+이것이 §0.5 I-4(하드웨어 우회)의 대가다.
+
+#### 2차 실패 — 백스톱도 조건부
+
+`executor_supervisor_node.py:898-906` 의 강제 릴리즈는 `tcp_z <= place_z_threshold`
+(launch 기본 110 mm) 조건부다. 팔이 ~115 mm 에서 멈추면 **백스톱도 발동하지 않는다.**
+⇒ 두 요인은 **병렬이 아니라 직렬**이다: 선진입 없음 → 정책이 못 냄 → 백스톱도 못 잡음.
+
+#### 논문 서술 (초안)
+
+> Training-time phase labels were generated with a fixed lookahead of one action horizon
+> (16 frames) relative to the gripper transition, applied uniformly across all 198 episodes.
+> At deployment the pick phase reproduced this lead through a height-triggered pre-arm,
+> whereas the release phase was detected from the executor's own gripper command and
+> therefore could not attain a positive lead under any parameter setting.
+
+⚠️ **"배포 release 프롬프트가 5프레임이라 짧다"는 서술은 쓰지 말 것.**
+`_V16_PHASE_KEY["return"] = "release"`(`task_node.py:71`) 이므로 전환 5프레임 이후에도
+**같은 문자열이 유지**된다. 결손은 오직 **open 이전 16프레임**이다.
+"짧다"고 쓰면 반박 지점이 생기고, 실제 발견(인과 루프)이 더 강한데 약하게 말하는 셈이 된다.
+
+⚠️ **근거 등급**: 학습 쪽(+16 프레임 · 198/198)은 **학습서버 측정**이고 이 Jetson에서 재현하지
+않았다. 배포 쪽은 전부 이 Jetson 소스 전수 확인이다. 본문에 쓸 때 출처를 나눠 적을 것.
 
 ---
 
@@ -221,6 +413,92 @@ Single-object recognition 20/20 · Color recognition 20/20 · Pick-and-place 18/
 **trial 단위 원본 증거가 이 Jetson 에 없다**(2026-07-24 감사 결론: NOTHING FOUND).
 공개 사이트도 "researcher-reported controlled-evaluation values" 로 표기했으므로 논문도 같은 수위.
 ⚠️ 이 20/20 계열은 **§A-5 의 20회 시도와 다른 실험이다** — 섞지 말 것.
+
+### B-5. ★ open-vocabulary grounding — 학습에 없던 명사로 접근 (사용자 육안 관찰)
+
+**관찰 (2026-08-07 사용자 확인, trial 수·로그 없음)**
+
+학습은 오렌지 박스 pick-and-place 뿐인데(방향 지시 포함), **학습에 없는 물체**에
+**방향어 없는 맨 명사 프롬프트**만 주었을 때 팔이 그 물체로 접근했다:
+
+```
+프롬프트:  "pick up the almond"   /   "pick up the egg"     ← 방향어 없음
+물체 위치: 학습 때 박스 자리와 다른 곳
+```
+
+**결과 (사용자 직접 확인, 2026-08-07)**: almond 와 charger 를 **동시에 놓고** 이름을 바꿔 부르면
+각각 그쪽으로 갔다. **동시 배치 + 맨 명사** 이므로 방향어·위치기억이 함께 배제된다.
+
+⚠️ **학습서버 초안은 같은 조합을 다르게 적었다** — *"Almond+Charger → 특정 목표로 못 가고 시작
+부근에서 흔들림, Almond+Egg → Almond 2/20"*. 사용자가 직접 "동시에, 둘 다 구분"이라고 확인했으므로
+**실행자 진술을 1차로 삼되**, 양쪽 다 로그가 없다는 점은 남긴다(전언이 갈린 상태).
+`2/20` 같은 수치는 **출처 확인 전 인용 금지**.
+
+⚠️ **almond·charger·marker 는 Jetson 코드에도 로그에도 없다** — `task_node.py:211-231` 에 있는 것은
+**can·egg 뿐**이고 그것도 방향어 포함 버전이다. 맨 명사 프롬프트는 직접 발행해야 한다.
+
+🔴 **사이트 `results.html` 의 80/80 이 어느 조건인지 확인이 필요하다**
+
+게시된 값: **Object-conditioned target approach 100 % (80/80)**, 세트 = almonds · egg · red box ·
+USB cable 각 20 trial. 그리고 `#two-stage-interpretation` 이 **approach 20/20 vs 완주 18/20** 로
+이미 두 단계를 분리해 보고한다(*"failures belong to the physical manipulation stage rather than
+initial target selection"*) — 오늘 정리한 분리와 같은 구조다.
+
+**그런데 그 80 trial 이 단일물체였는지 다물체였는지가 게시문에 없다.** 이게 주장 강도를 가른다:
+- **단일물체였다면** — 장면에 물체가 하나뿐이라 "지시된 대상으로 갔다"가 사실상 자명하다.
+  conditioned approach 라는 이름에 값이 실리지 않는다
+- **다물체였다면** — 80/80 이 그대로 **open-vocabulary reference resolution 의 정량 근거**가 된다
+
+⇒ 사용자의 almond+charger 동시 배치 관찰은 후자를 시사하지만 **게시 수치와 같은 실행인지 불명**이다.
+`results.html` 은 학습서버 소유가 아니라 SHARED 영역이므로 확인 후 문구를 명확히 할 것.
+
+**대안 설명이 전부 닫힌다 — 이게 이 관찰의 힘이다**
+
+| 대안 | 왜 배제되는가 |
+|---|---|
+| 방향어를 읽었다 | **프롬프트에 방향어가 없다.** 맨 명사뿐 |
+| 학습 위치를 외웠다 | 학습 박스 자리가 아닌 곳에 뒀고, **두 물체 중 명사만 바꿔** 대상이 갈렸다 |
+| 관절 배치를 외웠다 | **state 가 네트워크에 안 들어간다**(§ SHARED_MEMORY "state 가 모델에 아예 들어가지 않는다" — `pi0.py:151`/`:97`, `obs.state` 는 shape 만). 외울 경로 자체가 없다 |
+| 문자열을 외웠다 | 박스 실험에서 **동의문 3종**(`pick up` / `grasp` / `move`)이 통했다(`task_node.py:211-231` v13 세트) |
+
+⇒ 남는 단서는 **시각-언어 prefix 하나**다. VLM(Gemma 2B) 완전 frozen + SigLYP 9블록 rank-16 LoRA
+라는 선택의 배당금이고, **vision LoRA band 결과와 연결된다** — 공간 정보의 유일한 출처가 vision
+이므로 어느 band 를 적응시키는지가 표준 pi0 셋업보다 크게 작용한다(late 65 s vs early 125 s).
+
+🔴 **주장 범위를 반드시 이 선에서 끊을 것**
+
+- ✅ 주장 가능: **지시된 명사의 물체로 접근한다**(approach / pick target selection)
+- ❌ 주장 불가: **지시대로 놓는다** — 사용자 확인 "놓는 건 랜덤이었다".
+  방향 지시가 있는 pick-and-place 완주는 **학습한 박스에서만** 시연됐다
+- ✅ 박스에서는 **phase 진행까지** 확인됐다(PhaseTracker 가 흡착 상태+TCP Z 로 구동되므로
+  phase 가 넘어갔다는 건 시퀀스를 실제로 수행했다는 뜻)
+
+🔴 **계란·아몬드를 못 집은 것을 인식·해상도 한계로 귀속하지 말 것**
+
+E6 는 **흡착(suction) 엔드이펙터**다(`executor_supervisor_node.py:333`, `:687` `ToolDO`).
+흡착은 밀폐가 필요해 **평면만 가능**하다 — 박스·충전기 ✅ / 곡면 계란·불규칙 아몬드 ❌.
+이건 **사전에 알고 있던 하드웨어 제약**이고 정책·인식 한계가 아니다.
+⚠️ 학습서버 초안의 *"실패 모드는 언어가 아니라 물체 스케일이다"*(224px, patch≈25mm) 는
+**채택하지 않는다** — ① 작업영역 폭이 가정이고 E6 카메라 mm/px 실측이 없다
+② 스케일과 흡착 가능성이 **같은 순서를 예측**해 구분되지 않는다
+③ **almond·charger 는 실제로 구분됐다** — 인식이 실패한 게 아니다.
+정확한 문장: *grasp success is bounded by the suction end-effector (flat surfaces only);
+this is an end-effector constraint, not a perception one.*
+
+⚠️ **근거 등급 = 육안 관찰.** trial 수·성공률·로그가 없다. 그리고 **구조적으로 안 남는다** —
+지표가 흡착 ON 전환에만 찍히므로(`:1081`) TCP 도 그때만 기록된다(`:1144`).
+**접근만 성공하고 못 집으면 레코드가 0개**다. 성공한 관찰인데 남을 자리가 없었다.
+
+**재현 절차(다음에 로봇 앞에 앉을 때)** — 이걸로 육안이 좌표로 남는다
+1. 맨 명사 프롬프트 주입: `ros2 topic pub --once /e6/task/prompt std_msgs/msg/String "data: 'pick up the almond'"`
+   (또는 `/e6/voice/text_input` → `voice_command_node`). ⚠️ 맨 명사 프롬프트는 `task_node.py`
+   V13_PROMPTS 에 **없다**(거긴 방향어 포함 `can_*`/`egg_*` 뿐) — 직접 발행해야 한다
+2. **`record_mcap:=true`** — `/e6/robot/tcp` 가 18Hz 로 남으므로 **집지 못해도 궤적 방향이
+   사후에 객관적으로 판정된다.** 흡착 기반 필드로는 안 되는 게 이래서다
+3. 두 물체를 좌우로 벌려 두고 **명사만 번갈아** 발행 → 프로토콜 `named_object` /
+   `reached_object`(TCP 궤적에서 유도) 로 기록. 우연이 50 % 이므로 **횟수를 셀 것**
+
+---
 
 ### B-4. layer 26(끝단) 효과 — 사용자 실기 관찰: 차이 없음
 
@@ -413,3 +691,9 @@ inference_bridge_node.py:89    같은 설정으로 구독
 - [ ] fig3 를 논문에 넣을 때 "도착 간격은 forward 시간의 상한 근사" 한 줄 추가
 - [ ] Tier B 전부에 "n=3, researcher-reported" 표기
 - [ ] `figC` 부록 편입 여부 결정
+- [ ] **A-6** — 학습 쪽(+16 프레임 · 198/198)을 이 Jetson에서 독립 재현할지 결정.
+      데이터셋이 HDD에 있어 현재 불가. 못 하면 본문에 "학습서버 측정"으로 출처 분리
+- [ ] **III-3 근거 보강** — layer 26 null 은 n·수치 없는 관찰이라 §B-4 등급 유지.
+      band 효과(§A-5)만으로 서술하고 끝점은 "관찰" 로 적을 것
+- [ ] §0.5 를 논문 outline 으로 전개할 때 **I → II → III → IV 순서 유지**
+      (III 가 눈에 띄지만 I 없이는 III 가 나올 수 없다는 것이 서사다)

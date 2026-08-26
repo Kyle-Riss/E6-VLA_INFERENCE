@@ -32,11 +32,64 @@ class Pi0Config(_model.BaseModelConfig):
     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
     discrete_state_input: bool = None  # type: ignore
 
-    pytorch_compile_mode: str | None = None
-
+    # Optional LoRA on the SigLIP vision tower (separate from
+    # ``paligemma_variant`` which controls the Gemma LLM side). Set
+    # ``vision_lora_rank`` to a positive int to enable; layers outside
+    # ``vision_lora_layer_range`` (inclusive, 0-indexed) are masked out.
+    # The base SigLIP weights remain unchanged regardless — LoRA is added
+    # as a parallel residual.
     vision_lora_rank: int | None = None
     vision_lora_alpha: float = 16.0
-    vision_lora_layer_range: tuple | None = None
+    vision_lora_layer_range: tuple[int, int] | None = None
+
+    # Optional LoRA layer scoping for the action expert (Gemma 300m, depth 18).
+    # Only meaningful when ``action_expert_variant`` already enables LoRA
+    # (e.g. ``"gemma_300m_lora"``). Inclusive 0-indexed range; layers outside
+    # have their LoRA contribution multiplied by 0 (no forward effect, no
+    # gradient flow). When ``None``, LoRA is active on all 18 layers (legacy
+    # v2/v3 behavior). Used by v4 to constrain which expert layers adapt.
+    action_expert_lora_layer_range: tuple[int, int] | None = None
+
+    # Per-dimension loss weights applied to the squared flow-matching error
+    # before averaging over action_dim. Length must equal action_dim (32).
+    # E.g. set index 3 to 3.0 to up-weight j4 during training (v7).
+    # When None, all dimensions are weighted equally (legacy behavior).
+    action_loss_weights: tuple[float, ...] | None = None
+
+    # Path to a task-metric spec (see scripts/make_task_metric_spec.py). When set, the loss
+    # gains a term that scores the flow-matching residual by what it does to the tool rather
+    # than by its size in normalized action coordinates.
+    #
+    # It is a file rather than a set of fields because the term needs the dataset's own
+    # normalization constants, and the model cannot see those — they live in the transform
+    # stage. Resolving them once and writing them down also makes the calibration auditable
+    # instead of something to take on faith.
+    #
+    # None reproduces the standard objective exactly, which is the identity the unit tests
+    # check. Only the continuous arm joints enter this term: the suction channel is a binary
+    # actuator whose effect is not a displacement, so it keeps the ordinary objective.
+    task_metric_spec: str | None = None
+
+    # Keys that receive ONLY color augmentation (no spatial crop/rotate) during training.
+    # When None (default), any key containing "wrist" is treated as wrist-only.
+    # Set to () so that ALL camera slots receive spatial augmentation — correct for E6
+    # where both base_0_rgb (HIK) and left_wrist_0_rgb (ZED) are exterior cameras.
+    wrist_image_keys: tuple[str, ...] | None = None
+
+    # Camera slots the model consumes, in token order. Defaults to the DROID
+    # 3-slot layout that pi0/pi0.5 were pretrained with.
+    #
+    # Setups that fill a slot with zeros (E6/E7 pass ``right_wrist_0_rgb`` as
+    # zeros + mask False) can drop it here instead: a masked slot contributes
+    # nothing to the loss but still costs 256 tokens of sequence and a full
+    # SigLIP forward. Dropping it is numerically a no-op for the surviving
+    # tokens — ``positions`` is ``cumsum(input_mask)-1`` so masked tokens add 0,
+    # and ``make_attn_mask``'s ``valid_mask`` blocks them in both directions —
+    # and parameter shapes are unaffected (SigLIP weights are reused per image),
+    # so checkpoints stay loadable across the change.
+    image_keys: tuple[str, ...] = _model.IMAGE_KEYS
+
+    pytorch_compile_mode: str | None = "max-autotune"
 
     def __post_init__(self):
         if self.max_token_len is None:
@@ -71,16 +124,8 @@ class Pi0Config(_model.BaseModelConfig):
 
         with at.disable_typechecking():
             observation_spec = _model.Observation(
-                images={
-                    "base_0_rgb": image_spec,
-                    "left_wrist_0_rgb": image_spec,
-                    "right_wrist_0_rgb": image_spec,
-                },
-                image_masks={
-                    "base_0_rgb": image_mask_spec,
-                    "left_wrist_0_rgb": image_mask_spec,
-                    "right_wrist_0_rgb": image_mask_spec,
-                },
+                images={k: image_spec for k in self.image_keys},
+                image_masks={k: image_mask_spec for k in self.image_keys},
                 state=jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32),
                 tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
                 tokenized_prompt_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),
@@ -121,6 +166,12 @@ class Pi0Config(_model.BaseModelConfig):
         return nnx.All(*filters)
 
 
+# 🔴 E6 전용 — 2026-08-12 코드 드롭 병합 때 **되살린 함수**다.
+# 학습서버의 ad3685e 판 pi0_config.py 에는 이 함수가 없는데(그쪽에서 쓰지 않으므로)
+# 우리 트리의 E6 TrainConfig **20개**가 참조한다. 통째로 덮어썼더니
+# `AttributeError: module 'openpi.models.pi0_config' has no attribute ...` 로
+# config.py import 자체가 실패했다 — E7 뿐 아니라 E6 서빙도 같이 죽는다.
+# ⚠️ 다음에 학습서버 파일로 이 모듈을 교체할 때 **반드시 다시 확인할 것.**
 def freeze_filter_vlm_frozen_vision_and_action_lora() -> nnx.filterlib.Filter:
     """Freeze base weights; train vision LoRA + action-expert LoRA + action heads.
 
@@ -155,3 +206,71 @@ def freeze_filter_vlm_frozen_action_expert_lora_only() -> nnx.filterlib.Filter:
     expert_lora = nnx.All(has_lora, has_1)
     freeze_llm = nnx.All(llm, nnx.Not(expert_lora))
     return nnx.Any(img, freeze_llm)
+
+
+def freeze_filter_v3_vision_late_lora() -> nnx.filterlib.Filter:
+    """Freeze base PaliGemma, train only (action-expert LoRA + vision LoRA + action heads).
+
+    Use with ``paligemma_variant="gemma_2b"``, ``action_expert_variant="gemma_300m_lora"``,
+    AND ``vision_lora_rank`` set on :class:`Pi0Config`.
+
+    Trainable:
+      - Action-expert LoRA tensors  (paths matching both ``lora`` and ``_1``)
+      - Vision LoRA tensors          (paths under ``PaliGemma/img/...`` containing ``lora``)
+      - Action-side heads outside ``PaliGemma`` (``action_in_proj``, ``time_mlp_*``, ``action_out_proj``)
+
+    Frozen:
+      - All LLM base weights (``PaliGemma/llm/...`` minus action-expert LoRA)
+      - All SigLIP base weights (``PaliGemma/img/...`` minus vision LoRA)
+
+    Note: layers excluded by ``vision_lora_layer_range`` still allocate LoRA params
+    (because :func:`scan` stacks them along the depth axis), but their contribution
+    is multiplied by a zero mask so they never influence the loss and never receive
+    gradient. They effectively stay at init values throughout training.
+    """
+    llm = nnx_utils.PathRegex("PaliGemma/llm/.*")
+    img = nnx_utils.PathRegex("PaliGemma/img/.*")
+    has_lora = nnx_utils.PathRegex(".*lora.*")
+    has_1 = nnx_utils.PathRegex(".*_1.*")
+    expert_lora = nnx.All(has_lora, has_1)
+    img_lora = nnx.All(img, has_lora)
+    freeze_llm = nnx.All(llm, nnx.Not(expert_lora))
+    freeze_img = nnx.All(img, nnx.Not(img_lora))
+    return nnx.Any(freeze_img, freeze_llm)
+
+
+def freeze_filter_v4_combined_lora() -> nnx.filterlib.Filter:
+    """Same gradient mask as v3: vision LoRA + action-expert LoRA + small action heads trainable.
+
+    v4 adds layer-range scoping on the action expert via
+    :attr:`Pi0Config.action_expert_lora_layer_range`, but that scoping happens
+    at forward time inside ``gemma.Module`` (via per-layer mask × LoRA output).
+    The freeze filter — which decides which params get a gradient slot in the
+    optimizer — does not need to change: out-of-range expert LoRA params are
+    still allocated, still listed as "trainable" by the filter, and the mask
+    zeroes their forward contribution so their gradient is exactly 0. This
+    function therefore delegates to :func:`freeze_filter_v3_vision_late_lora`
+    and is kept as an alias for clarity in v4 ``TrainConfig``s.
+    """
+    return freeze_filter_v3_vision_late_lora()
+
+
+def freeze_filter_vision_full_finetune() -> nnx.filterlib.Filter:
+    """Full SigLIP fine-tuning: freeze only LLM base weights, everything else trainable.
+
+    Trainable:
+      - All SigLIP (PaliGemma/img) base weights — no LoRA, direct weight update
+      - Action-expert LoRA tensors (paths matching both ``lora`` and ``_1``)
+      - Action-side heads (``action_in_proj``, ``time_mlp_*``, ``action_out_proj``)
+
+    Frozen:
+      - All LLM base weights (``PaliGemma/llm/...`` minus action-expert LoRA)
+
+    Use with ``vision_lora_rank=None`` (no LoRA adapters on SigLIP).
+    """
+    llm = nnx_utils.PathRegex("PaliGemma/llm/.*")
+    has_lora = nnx_utils.PathRegex(".*lora.*")
+    has_1 = nnx_utils.PathRegex(".*_1.*")
+    expert_lora = nnx.All(has_lora, has_1)
+    freeze_llm = nnx.All(llm, nnx.Not(expert_lora))
+    return freeze_llm

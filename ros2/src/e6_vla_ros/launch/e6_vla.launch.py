@@ -99,6 +99,14 @@ def generate_launch_description():
         DeclareLaunchArgument("mpc_a_max",              default_value="2.0"),     # deg/step^2 (hard_accel용)
         DeclareLaunchArgument("mpc_hard_accel",         default_value="false"),   # true=가속 hard 제약(기본 soft)
 
+        # ── Chunk pacing 인자 (burst-then-freeze 완화, 3-arm 공통 적용) ─────────
+        DeclareLaunchArgument("pace_to_arrival",        default_value="true"),    # false=기존 동작과 100% 동일
+        DeclareLaunchArgument("pace_interval_ema_alpha", default_value="0.3"),
+        DeclareLaunchArgument("pace_interval_default_ms", default_value="2100.0"),
+        DeclareLaunchArgument("pace_interval_min_ms",   default_value="500.0"),
+        DeclareLaunchArgument("pace_interval_max_ms",   default_value="3500.0"),
+        DeclareLaunchArgument("pace_k_max",             default_value="12"),
+
         # ── 음성 명령 인자 ─────────────────────────────────────────────────────
         DeclareLaunchArgument("use_voice",              default_value="false"),   # voice_command_node 활성화
         DeclareLaunchArgument("use_mic",                default_value="true"),    # 마이크 캡처 활성화 (false=텍스트 전용)
@@ -196,6 +204,12 @@ def generate_launch_description():
                 "mpc_backend":                 LaunchConfiguration("mpc_backend"),
                 "mpc_a_max":                   LaunchConfiguration("mpc_a_max"),
                 "mpc_hard_accel":              LaunchConfiguration("mpc_hard_accel"),
+                "pace_to_arrival":             LaunchConfiguration("pace_to_arrival"),
+                "pace_interval_ema_alpha":     LaunchConfiguration("pace_interval_ema_alpha"),
+                "pace_interval_default_ms":    LaunchConfiguration("pace_interval_default_ms"),
+                "pace_interval_min_ms":        LaunchConfiguration("pace_interval_min_ms"),
+                "pace_interval_max_ms":        LaunchConfiguration("pace_interval_max_ms"),
+                "pace_k_max":                  LaunchConfiguration("pace_k_max"),
                 "max_steps":                   LaunchConfiguration("max_steps"),
                 "min_steps":                   LaunchConfiguration("min_steps"),
                 "home_tol_deg":                LaunchConfiguration("home_tol_deg"),

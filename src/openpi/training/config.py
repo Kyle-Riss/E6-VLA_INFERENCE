@@ -20,6 +20,12 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.e6_policy as e6_policy
+
+# 🔴 2026-08-12 — `config_snippets.py` 에 이 import 가 빠져 있었다.
+# `LeRobotE7DataConfig.create()` 가 `e7_policy.E7Inputs` 를 부르는데 `NameError` 로
+# 죽는다. ⚠️ **README 의 `984` 게이트는 이걸 못 잡는다** — 그 게이트는 `t.model.*` 만
+# 보고 `data.create()` 를 부르지 않기 때문이다(실제로 통과한 뒤에 발견했다).
+import openpi.policies.e7_policy as e7_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
@@ -90,6 +96,18 @@ class DataConfig:
 
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
+
+    # Caps how much more a low-variance dimension can be amplified than the median
+    # dimension under quantile normalization. See `transforms.quantile_bounds`.
+    # None keeps the unmodified quantile rule (bit-for-bit). Only used when
+    # `use_quantile_norm` is true.
+    #
+    # 🔴 필수 필드다 — `policy_config.py` 가 `data_config.quantile_range_floor` 를
+    #    무조건 읽으므로 없으면 AttributeError 로 **E6 서빙까지 죽는다**
+    #    (2026-08-12 코드 드롭 병합 시 발견. 학습서버 패키지에 빠져 있었다).
+    # ⚠️ E7 grounded 는 **None** 이다(학습서버 확인). 트리에 있는 4.0/6.0/8.0 은
+    #    E6 v34/v37/v38 정규화 대조군 값이므로 **가져오지 말 것**.
+    quantile_range_floor: float | None = None
 
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
@@ -595,8 +613,264 @@ class TrainConfig:
             raise ValueError("Cannot resume and overwrite at the same time.")
 
 
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotE7DataConfig(DataConfigFactory):
+    """Data config for xArm 6 (E7) LeRobot dataset.
+
+    State/action are 7D: [j1..j6, gripper] — identical in shape and semantics to
+    E6, so the same LeRobot schema and conversion contract apply:
+        state  = [j1..j6 (t), gripper_command (t)]        degrees, absolute
+        action = [Δj1..Δj6 (t→t+1), gripper_command (t+1)] deg/frame, gripper absolute
+
+    Deliberately NO DROID 8D alignment (no dummy j7, gripper stays at index 6):
+    E6 v23 — the reference run for the E6→E7 cross-embodiment comparison — used
+    ``align_droid_state=False``, and the padded dims cost ~1% of the loss anyway
+    (measured on v23), so there is nothing to gain from realigning here.
+    """
+
+    # Feed the dedicated shelf-label view into the third image slot.
+    #
+    # This is the manipulated variable of the main ablation, not a convenience:
+    # the 2-slot and 3-slot conditions are trained from the SAME converted
+    # dataset and differ only here (plus the matching ``image_keys`` on the
+    # model). Leaving it False on a dataset that has ``label_image`` silently
+    # drops the column, which is exactly the 2-slot baseline.
+    use_label_view: bool = False
+
+    # Photometric jitter on the label slot. TRAINING ONLY -- accepted so a v2
+    # TrainConfig resolves, and deliberately not acted on here: the robot must see its
+    # own cameras unmodified. The training tree assembles it into a group that
+    # `create_trained_policy` never reads, so there is nothing to reproduce.
+    label_jitter: bool = False
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack = {
+            "observation/exterior_image_1_left": "exterior_image_1_left",
+            "observation/exterior_image_2_left": "exterior_image_2_left",
+            "observation/state": "state",
+            "actions": "action",
+            "prompt": "prompt",
+        }
+        if self.use_label_view:
+            repack["observation/label_image"] = "label_image"
+        repack_transform = _transforms.Group(
+            inputs=[_transforms.RepackTransform(repack)]
+        )
+        data_transforms = _transforms.Group(
+            inputs=[e7_policy.E7Inputs(model_type=model_config.model_type)],
+            outputs=[e7_policy.E7Outputs()],
+        )
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
+
 # Use `get_config` if you need to get a config by name in your code.
 _CONFIGS = [
+    TrainConfig(
+        name="pi05_e7_grounded_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+            # On. With pi05 the continuous state path does not exist -- `state_proj`
+            # is only built in the pi0 branch and `embed_suffix` skips the state
+            # token -- so this flag is the ONLY way proprioception reaches the
+            # network. Left at the inherited False (upstream `pi05_libero`, copied
+            # through every E6 config) the policy sees images and text and nothing
+            # else: it reads its own arm off the ZED view. E6 was a top-down suction
+            # pick and place and could afford that; E7 pushes a book along +x into a
+            # 350 mm slot, and depth along the camera axis is exactly what a 224 px
+            # view resolves worst.
+            #
+            # It is free in sequence budget. The text slot is padded to
+            # `max_token_len` either way, so the length stays 984; what changes is
+            # how much of the 200 is real -- measured 11 -> 43 tokens on
+            # "insert the liberal arts book into the appropriate shelf". Only the
+            # true 7 dims are written, because TokenizePrompt runs BEFORE
+            # PadStatesAndActions in ModelTransformFactory; the 32-dim padding never
+            # reaches the tokenizer.
+            discrete_state_input=True,
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m_lora_r16",
+            vision_lora_rank=16,
+            vision_lora_alpha=16.0,
+            vision_lora_layer_range=(18, 26),
+            action_expert_lora_layer_range=None,
+            wrist_image_keys=(),
+            image_keys=("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb"),
+        ),
+        data=LeRobotE7DataConfig(
+            repo_id="local/e7_books_v4",
+            use_label_view=True,
+            base_config=DataConfig(prompt_from_task=True, action_sequence_keys=("action",)),
+            assets=AssetsConfig(assets_dir="assets/pi05_e7_grounded_lora", asset_id="local/e7_books_v4"),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=20_000,
+        batch_size=8,
+        log_interval=50,
+        save_interval=2500,
+        keep_period=10_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=20_000),
+        freeze_filter=pi0_config.freeze_filter_v4_combined_lora(),
+        ema_decay=None,
+    ),
+    TrainConfig(
+        name="pi05_e7_grounded_v2_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+            # On. With pi05 the continuous state path does not exist -- `state_proj`
+            # is only built in the pi0 branch and `embed_suffix` skips the state
+            # token -- so this flag is the ONLY way proprioception reaches the
+            # network. Left at the inherited False (upstream `pi05_libero`, copied
+            # through every E6 config) the policy sees images and text and nothing
+            # else: it reads its own arm off the ZED view. E6 was a top-down suction
+            # pick and place and could afford that; E7 pushes a book along +x into a
+            # 350 mm slot, and depth along the camera axis is exactly what a 224 px
+            # view resolves worst.
+            #
+            # It is free in sequence budget. The text slot is padded to
+            # `max_token_len` either way, so the length stays 984; what changes is
+            # how much of the 200 is real -- measured 11 -> 43 tokens on
+            # "insert the liberal arts book into the appropriate shelf". Only the
+            # true 7 dims are written, because TokenizePrompt runs BEFORE
+            # PadStatesAndActions in ModelTransformFactory; the 32-dim padding never
+            # reaches the tokenizer.
+            discrete_state_input=True,
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m_lora_r16",
+            vision_lora_rank=16,
+            vision_lora_alpha=16.0,
+            vision_lora_layer_range=(18, 26),
+            action_expert_lora_layer_range=None,
+            wrist_image_keys=(),
+            image_keys=("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb"),
+        ),
+        data=LeRobotE7DataConfig(
+            repo_id="local/e7_books_v4",
+            use_label_view=True,
+            label_jitter=True,
+            base_config=DataConfig(prompt_from_task=True, action_sequence_keys=("action",)),
+            assets=AssetsConfig(assets_dir="assets/pi05_e7_grounded_v2_lora", asset_id="local/e7_books_v4"),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=20_000,
+        batch_size=8,
+        log_interval=50,
+        save_interval=2500,
+        keep_period=10_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=20_000),
+        freeze_filter=pi0_config.freeze_filter_v4_combined_lora(),
+        ema_decay=None,
+    ),
+    TrainConfig(
+        # Serves the 2026-08-19 bundle (`e7_v2_60_bundle`, step 19999), trained on
+        # the corpus collected AFTER the 08-15 camera move. Same model as
+        # `pi05_e7_grounded_lora` in every field; the only differences are the
+        # dataset identifiers.
+        #
+        # It has to exist as its own entry rather than reusing the grounded config,
+        # because `--policy.config` resolves the TrainConfig from THIS source tree
+        # and `create_trained_policy` reads norm stats from
+        # `<bundle>/assets/<data_config.asset_id>/norm_stats.json`. The bundle ships
+        # them under `local/e7_books_v2_60`; pointed at `local/e7_books_v4` the load
+        # dies with FileNotFoundError, and pointed at v1's stats it would normalise
+        # against a different camera rig with a different divisor (47 train episodes,
+        # holdout excluded) -- which does not raise at all.
+        name="pi05_e7_v2_60_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+            # On, for the reasons spelled out on `pi05_e7_grounded_lora` above. The
+            # bundle manifest carries `discrete_state_input: true`, and the startup
+            # gate compares it, so a False here would be caught -- but only if the
+            # gate runs; keep the two in step.
+            discrete_state_input=True,
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m_lora_r16",
+            vision_lora_rank=16,
+            vision_lora_alpha=16.0,
+            vision_lora_layer_range=(18, 26),
+            action_expert_lora_layer_range=None,
+            wrist_image_keys=(),
+            image_keys=("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb"),
+        ),
+        data=LeRobotE7DataConfig(
+            repo_id="local/e7_books_v2_60",
+            use_label_view=True,
+            base_config=DataConfig(prompt_from_task=True, action_sequence_keys=("action",)),
+            assets=AssetsConfig(assets_dir="assets/pi05_e7_v2_60_lora", asset_id="local/e7_books_v2_60"),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=20_000,
+        batch_size=8,
+        log_interval=50,
+        save_interval=2500,
+        keep_period=10_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=20_000),
+        freeze_filter=pi0_config.freeze_filter_v4_combined_lora(),
+        ema_decay=None,
+    ),
+    TrainConfig(
+        # Serves the 2026-08-20 bundle (`e7_v2_120_step20000_bundle`, step 20000),
+        # trained on the 119-episode corpus with FOUR sign layouts. Same model as
+        # `pi05_e7_v2_60_lora` in every field; only the dataset identifiers differ.
+        #
+        # Why the four layouts matter: in v2_60 `science` sat on the right in both
+        # layouts, so position memory alone scored 66.7% and science had to be
+        # excluded from any grounding claim. Here all three categories reach all
+        # three shelves (20/10/10 each), which drops the position-memory ceiling to
+        # 50% and the brightness-only baseline to chance (32.5%). All three
+        # categories become usable.
+        #
+        # As with the v2_60 entry, this must exist as its own TrainConfig because
+        # `--policy.config` resolves the name from THIS source tree and
+        # `create_trained_policy` reads norm stats from
+        # `<bundle>/assets/<asset_id>/norm_stats.json`. The stats here were
+        # recomputed from the new train split (95 episodes, 24 held out); reusing
+        # v2_60's would normalise against a different divisor and would NOT raise.
+        name="pi05_e7_v2_120_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+            # On, for the reasons spelled out on `pi05_e7_grounded_lora` above.
+            discrete_state_input=True,
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m_lora_r16",
+            vision_lora_rank=16,
+            vision_lora_alpha=16.0,
+            vision_lora_layer_range=(18, 26),
+            action_expert_lora_layer_range=None,
+            wrist_image_keys=(),
+            image_keys=("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb"),
+        ),
+        data=LeRobotE7DataConfig(
+            repo_id="local/e7_books_v2_120",
+            use_label_view=True,
+            base_config=DataConfig(prompt_from_task=True, action_sequence_keys=("action",)),
+            assets=AssetsConfig(assets_dir="assets/pi05_e7_v2_120_lora", asset_id="local/e7_books_v2_120"),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=40_000,
+        batch_size=8,
+        log_interval=50,
+        save_interval=2500,
+        keep_period=10_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=40_000),
+        freeze_filter=pi0_config.freeze_filter_v4_combined_lora(),
+        ema_decay=None,
+    ),
     #
     # Inference Aloha configs.
     #
