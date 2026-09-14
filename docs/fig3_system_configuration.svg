@@ -1,0 +1,137 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 720" width="1280" height="720"
+     font-family="Helvetica, Arial, sans-serif">
+  <!-- System Configuration (paper Fig. 5) — E6 VLA on-device inference rig.  16:9, 1280x720.
+
+       DESIGN RULES (keep these):
+        1. Hardware diagram. A box carries a NAME plus at most one qualifier. Rates, node
+           counts and spec numbers live in the prose, never in a box.
+        2. Detail comes from LINE ART, not from more words. Icons and port stubs fill the
+           frame; that is what makes it read as a hardware figure at 16:9.
+        3. The claim "execution is the ROS 2 stack, not the policy" is shown GEOMETRICALLY:
+           both Ethernet links are rooted in the ROS 2 box and leave through a port stub on
+           its right edge; the policy server sits below with no path to the arm.
+        4. Type floor is 19 px so nothing falls under about 7.5 pt at 180 mm print width.
+
+       Verified on branch mpc+ :
+         :29999 command socket    executor_supervisor_node.py:443  DobotApiDashboard
+         :30005 real time socket  camera_state_node.py:119         DobotApiFeedBack
+         WebSocket 127.0.0.1:8000 inference_bridge_node.py:54 to 55
+         policy server has no robot or camera access (grep over serve_policy.py: 0 hits)
+       Author supplied (rig knowledge, not derivable from code):
+         Ethernet address 192.168.6.1 AS RUN. The code DEFAULT is 192.168.5.1
+         (executor_supervisor_node.py:117, camera_state_node.py:65, e6_vla.launch.py:21)
+         and robot_ip is a launch argument, so the default is NOT evidence of the address
+         used.  DO NOT "correct" this back.
+         camera roles and suction through the 16 pin I/O port.
+       Interfaces VERIFIED on this Jetson (2026-08-28), NOT author supplied:
+         HIK  lsusb -> "2bdf:0001 U3V MV-CE050-30UC" (Hikrobot, USB3 Vision, 5 MP,
+              which is the 2592x1944 native frame measured in camera_viewer)
+         ZED  GMSL2, NOT USB. dpkg: stereolabs-zedlink-duo 1.4.1-LI-MAX96712-L4T36.5.0
+              installed; lsmod: sl_zedx (refcount 2), sl_max96712 deserialiser,
+              sl_max9295 serialiser, tegra_camera; /dev/video0 and /dev/video1 are CSI
+              nodes; lsusb has NO Stereolabs vendor 2b03 device.
+       An earlier draft said both cameras were on USB 3.0. That was wrong for the ZED. -->
+  <defs>
+    <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#111"/>
+    </marker>
+    <marker id="ahb" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#1a5fb4"/>
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="1280" height="720" fill="#ffffff"/>
+
+  <!-- ===================== zone headers ===================== -->
+  <text x="165"  y="58" text-anchor="middle" font-size="24" font-weight="bold" fill="#6b7686" letter-spacing="2.5">PERCEPTION</text>
+  <text x="610"  y="58" text-anchor="middle" font-size="24" font-weight="bold" fill="#6b7686" letter-spacing="2.5">ON-DEVICE COMPUTE</text>
+  <text x="1120" y="58" text-anchor="middle" font-size="24" font-weight="bold" fill="#6b7686" letter-spacing="2.5">MANIPULATION</text>
+
+  <!-- ===================== HIK camera : USB3 Vision ===================== -->
+  <rect x="40" y="120" width="250" height="200" rx="8" fill="#ffffff" stroke="#111" stroke-width="2.4"/>
+  <rect x="103" y="142" width="80" height="50" rx="3" fill="#ffffff" stroke="#111" stroke-width="2.4"/>
+  <rect x="183" y="155" width="28" height="24" fill="#ffffff" stroke="#111" stroke-width="2.4"/>
+  <circle cx="216" cy="167" r="13" fill="#ffffff" stroke="#111" stroke-width="2.4"/>
+  <text x="165" y="232" text-anchor="middle" font-size="30" font-weight="bold" fill="#111">HIK camera</text>
+  <text x="165" y="262" text-anchor="middle" font-size="19" fill="#111">MV-CE050-30UC</text>
+  <text x="165" y="290" text-anchor="middle" font-size="19" fill="#111">workspace front view</text>
+
+  <!-- ===================== ZED X : GMSL2, not USB ===================== -->
+  <rect x="40" y="340" width="250" height="200" rx="8" fill="#ffffff" stroke="#111" stroke-width="2.4"/>
+  <rect x="105" y="362" width="120" height="42" rx="6" fill="#ffffff" stroke="#111" stroke-width="2.4"/>
+  <circle cx="131" cy="383" r="14" fill="#ffffff" stroke="#111" stroke-width="2.4"/>
+  <circle cx="199" cy="383" r="14" fill="#ffffff" stroke="#111" stroke-width="2.4"/>
+  <text x="165" y="452" text-anchor="middle" font-size="30" font-weight="bold" fill="#111">ZED X camera</text>
+  <text x="165" y="482" text-anchor="middle" font-size="19" fill="#111">via ZED Link Duo</text>
+  <text x="165" y="510" text-anchor="middle" font-size="19" fill="#111">full-arm view</text>
+
+  <line x1="290" y1="220" x2="415" y2="220" stroke="#111" stroke-width="2.6" marker-end="url(#ah)"/>
+  <text x="340" y="198" text-anchor="middle" font-size="22" fill="#111">USB 3.0</text>
+
+  <line x1="290" y1="440" x2="415" y2="440" stroke="#111" stroke-width="2.6" marker-end="url(#ah)"/>
+  <text x="340" y="418" text-anchor="middle" font-size="22" fill="#111">GMSL2</text>
+
+  <!-- ===================== Jetson board ===================== -->
+  <rect x="390" y="90" width="440" height="590" rx="14"
+        fill="#f5f6f8" stroke="#555" stroke-width="2.2" stroke-dasharray="11 7"/>
+  <text x="610" y="138" text-anchor="middle" font-size="34" font-weight="bold" fill="#111">NVIDIA Jetson AGX Orin</text>
+
+  <!-- ROS 2 stack: owns the hardware; both robot links are rooted here -->
+  <rect x="415" y="165" width="390" height="290" rx="8" fill="#ffffff" stroke="#111" stroke-width="2.4"/>
+  <text x="610" y="298" text-anchor="middle" font-size="32" font-weight="bold" fill="#111">ROS 2 Humble</text>
+  <text x="610" y="340" text-anchor="middle" font-size="24" fill="#111">control and execution</text>
+  <!-- USB port stubs where the camera links land -->
+  <rect x="407" y="213" width="9" height="15" fill="#111"/>
+  <rect x="407" y="433" width="9" height="15" fill="#111"/>
+  <!-- Ethernet port stubs where the robot links leave -->
+  <rect x="804" y="207" width="9" height="15" fill="#1a5fb4"/>
+  <rect x="804" y="332" width="9" height="15" fill="#1a5fb4"/>
+
+  <line x1="470" y1="455" x2="470" y2="520" stroke="#111" stroke-width="2.6"
+        marker-start="url(#ah)" marker-end="url(#ah)"/>
+  <text x="494" y="482" font-size="22" fill="#111">WebSocket</text>
+  <text x="494" y="512" font-size="22" fill="#111">127.0.0.1:8000</text>
+
+  <!-- policy server: subordinate, no path to the robot -->
+  <rect x="415" y="520" width="390" height="135" rx="8" fill="#ffffff" stroke="#111" stroke-width="2.4"/>
+  <text x="610" y="580" text-anchor="middle" font-size="32" font-weight="bold" fill="#111">π0 Policy Server</text>
+  <text x="610" y="620" text-anchor="middle" font-size="24" fill="#111">inference</text>
+
+  <!-- ===================== Ethernet: two sockets ===================== -->
+  <line x1="813" y1="215" x2="990" y2="215" stroke="#1a5fb4" stroke-width="3.2" marker-end="url(#ahb)"/>
+  <text x="899" y="168" text-anchor="middle" font-size="24" font-weight="bold" fill="#1a5fb4">:29999</text>
+  <text x="899" y="196" text-anchor="middle" font-size="22" fill="#1a5fb4">joint command</text>
+
+  <text x="899" y="258" text-anchor="middle" font-size="19" font-weight="bold" fill="#111">Ethernet (TCP/IP)</text>
+  <text x="899" y="286" text-anchor="middle" font-size="22" fill="#111">192.168.6.1</text>
+
+  <line x1="990" y1="340" x2="813" y2="340" stroke="#1a5fb4" stroke-width="3.2"
+        stroke-dasharray="10 7" marker-end="url(#ahb)"/>
+  <text x="899" y="372" text-anchor="middle" font-size="24" font-weight="bold" fill="#1a5fb4">:30005</text>
+  <text x="899" y="400" text-anchor="middle" font-size="19" fill="#1a5fb4">real-time socket</text>
+
+  <!-- ===================== robot arm ===================== -->
+  <rect x="990" y="120" width="260" height="310" rx="8" fill="#ffffff" stroke="#111" stroke-width="2.4"/>
+  <rect x="1090" y="290" width="60" height="16" fill="#111"/>
+  <line x1="1120" y1="290" x2="1120" y2="225" stroke="#111" stroke-width="12" stroke-linecap="round"/>
+  <line x1="1120" y1="225" x2="1175" y2="180" stroke="#111" stroke-width="12" stroke-linecap="round"/>
+  <line x1="1175" y1="180" x2="1150" y2="140" stroke="#111" stroke-width="12" stroke-linecap="round"/>
+  <circle cx="1120" cy="225" r="9" fill="#ffffff" stroke="#111" stroke-width="2.4"/>
+  <circle cx="1175" cy="180" r="9" fill="#ffffff" stroke="#111" stroke-width="2.4"/>
+  <text x="1120" y="342" text-anchor="middle" font-size="20" fill="#111">Dobot</text>
+  <text x="1120" y="378" text-anchor="middle" font-size="30" font-weight="bold" fill="#111">Magician E6</text>
+  <text x="1120" y="410" text-anchor="middle" font-size="20" fill="#111">6-DoF arm</text>
+
+  <line x1="1120" y1="430" x2="1120" y2="500" stroke="#111" stroke-width="2.6" marker-end="url(#ah)"/>
+  <text x="1142" y="452" font-size="22" fill="#111">ToolDO</text>
+  <text x="1142" y="480" font-size="20" fill="#111">16-pin I/O</text>
+
+  <!-- ===================== vacuum gripper ===================== -->
+  <rect x="990" y="500" width="260" height="160" rx="8" fill="#ffffff" stroke="#111" stroke-width="2.4"/>
+  <rect x="1112" y="525" width="16" height="26" fill="#111"/>
+  <polygon points="1098,551 1142,551 1154,576 1086,576" fill="#ffffff" stroke="#111" stroke-width="2.4"/>
+  <text x="1120" y="622" text-anchor="middle" font-size="28" font-weight="bold" fill="#111">Vacuum gripper</text>
+  <text x="1120" y="650" text-anchor="middle" font-size="19" fill="#111">suction end effector</text>
+</svg>

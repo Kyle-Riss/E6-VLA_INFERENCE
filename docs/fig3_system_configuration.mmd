@@ -1,0 +1,46 @@
+%% System Configuration (paper Fig. 5) — E6 VLA on-device inference rig
+%% Mermaid skeleton only. The paper-ready vector is docs/fig3_system_configuration.svg
+%% (16:9, 1280x720, hand-authored so label placement and B&W legibility are controlled).
+%%
+%% DESIGN RULE: hardware diagram. A node carries a NAME plus at most one qualifier;
+%% rates and node counts live in the prose. Both robot links leave the ROS 2 node, not
+%% the policy server — that geometry is the one claim the drawing makes on its own.
+%%
+%% Verified on branch mpc+ :
+%%   :29999 command   executor_supervisor_node.py:443   DobotApiDashboard
+%%   :30005 real-time camera_state_node.py:119          DobotApiFeedBack
+%%   WebSocket 127.0.0.1:8000   inference_bridge_node.py:54-55
+%% Author-supplied: Ethernet 192.168.6.1 as run (code default 192.168.5.1 is a launch
+%%   argument, so it is not evidence of the address used — do not "correct" this),
+%%   camera roles and suction via the 16-pin I/O port.
+%% Interfaces verified on the Jetson: HIK is USB3 Vision (lsusb 2bdf:0001 MV-CE050-30UC);
+%%   ZED X is GMSL2 via a ZED Link Duo card (sl_zedx + sl_max96712, no USB 2b03 device).
+
+flowchart LR
+    cam1["HIK MV-CE050-30UC<br/>workspace front view"]
+    cam2["ZED X stereo camera<br/>full-arm view"]
+
+    subgraph jetson["NVIDIA Jetson AGX Orin"]
+        direction TB
+        ros2["ROS 2 Humble<br/>control and execution"]
+        policy["π0 Policy Server<br/>inference"]
+        ros2 <-- "WebSocket 127.0.0.1:8000" --> policy
+    end
+
+    e6["Dobot Magician E6<br/>6-DoF arm"]
+    grip["Vacuum gripper"]
+
+    cam1 -- "USB 3.0" --> ros2
+    cam2 -- "GMSL2 · ZED Link Duo" --> ros2
+
+    ros2 -- ":29999 joint command" --> e6
+    e6 -. ":30005 real-time socket" .-> ros2
+    e6 -- "ToolDO · 16-pin I/O" --> grip
+
+    classDef box fill:#ffffff,stroke:#111111,stroke-width:2px,color:#111111
+    classDef board fill:#f5f6f8,stroke:#555555,stroke-width:2px,color:#111111
+    class cam1,cam2,ros2,policy,e6,grip box
+    class jetson board
+
+    linkStyle 2 stroke:#1a5fb4,stroke-width:3px,color:#1a5fb4
+    linkStyle 3 stroke:#1a5fb4,stroke-width:3px,color:#1a5fb4

@@ -1,0 +1,110 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 720" width="1280" height="720"
+     font-family="Helvetica, Arial, 'Liberation Sans', sans-serif">
+  <!-- Deployment and runtime (paper figure) — E6 VLA.  16:9, 1280x720.
+
+       THIS REVISION = the previous drawing with ONE change: the two cameras were taken out of
+       the Jetson board and drawn outside it, on the left, under the training server. Every other
+       coordinate is unchanged — board 380,70 860x530; stage 3 at 705,210; the stage 4 layer stack
+       at 955,210 / 320 / 450; the robot at 955,620; all font sizes as before.
+       The box that stays inside the board is the software step (cropping), now titled
+       Preprocessing; the camera NAMES moved out because a camera is hardware.
+       DO NOT move the cameras back inside, and do not reflow the rest of the drawing.
+
+       Stages are the author's (1) deploy (2) dual camera preprocessing (3) VLA inference
+       (4) ROS 2 control, and stage 4 is a stratified stack with shared edges so the ROS 2 side
+       reads as layers.
+
+       NOTE ON THE FILE NAME: the label v23.pt follows the author's text. On disk the v23
+       checkpoint is a directory (config.json + model.safetensors + assets/norm_stats.json) and
+       no .pt file exists under e6_checkpoints. The author was told once and chose this label;
+       do not change it without asking.
+
+       Verified on branch mpc+ :
+         HIK chain  hardware/camera_capture.py:252-256
+                    native to 640x480 to 320x240, crop[16:240, 55:279], 224x224
+         ZED chain  camera_state_node.py:222-225
+                    HD1080 to 640x480, crop[120:480, 150:510], 224x224
+                    both chains identical to the training time preprocessing
+         chunk      action_horizon 16, steps_per_inference default 8
+                    e6_vla.launch.py:32, executor_supervisor_node.py:139
+         topic      /e6/policy/action_chunk
+         driver     MovJ and ServoJ over the command socket, executor_supervisor_node.py:443 -->
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#111"/>
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="1280" height="720" fill="#ffffff"/>
+
+  <!-- ===================== stage 1 : deployment ===================== -->
+  <text x="40" y="52" font-size="22" font-weight="bold" fill="#6b7686" letter-spacing="2">① DEPLOYMENT</text>
+
+  <rect x="40" y="70" width="240" height="120" rx="8" fill="#ffffff" stroke="#111" stroke-width="2.4"/>
+  <text x="160" y="118" text-anchor="middle" font-size="22" font-weight="bold" fill="#111">Training server</text>
+  <text x="160" y="152" text-anchor="middle" font-size="20" fill="#111">π0 fine-tuning</text>
+
+  <line x1="280" y1="130" x2="380" y2="130" stroke="#111" stroke-width="2.6" marker-end="url(#a)"/>
+  <text x="330" y="108" text-anchor="middle" font-size="22" font-weight="bold" fill="#1a5fb4">v23.pt</text>
+
+  <!-- ===================== cameras : moved OUT of the board ===================== -->
+  <rect x="40" y="240" width="240" height="120" rx="8" fill="#ffffff" stroke="#111" stroke-width="2.4"/>
+  <text x="160" y="292" text-anchor="middle" font-size="26" font-weight="bold" fill="#111">HIK camera</text>
+  <text x="160" y="326" text-anchor="middle" font-size="20" fill="#111">workspace view</text>
+
+  <rect x="40" y="400" width="240" height="120" rx="8" fill="#ffffff" stroke="#111" stroke-width="2.4"/>
+  <text x="160" y="452" text-anchor="middle" font-size="26" font-weight="bold" fill="#111">ZED X camera</text>
+  <text x="160" y="486" text-anchor="middle" font-size="20" fill="#111">full-arm view</text>
+
+  <line x1="280" y1="300" x2="405" y2="300" stroke="#111" stroke-width="2.6" marker-end="url(#a)"/>
+  <line x1="280" y1="460" x2="405" y2="460" stroke="#111" stroke-width="2.6" marker-end="url(#a)"/>
+
+  <!-- ===================== Jetson board ===================== -->
+  <rect x="380" y="70" width="860" height="530" rx="14"
+        fill="#f5f6f8" stroke="#555" stroke-width="2.2" stroke-dasharray="11 7"/>
+  <text x="810" y="112" text-anchor="middle" font-size="26" font-weight="bold" fill="#111">NVIDIA Jetson AGX Orin — Inference Node</text>
+  <text x="810" y="146" text-anchor="middle" font-size="20" fill="#111">loads v23.pt at start-up</text>
+
+  <!-- ===================== stage 2 : preprocessing ===================== -->
+  <text x="405" y="192" font-size="22" font-weight="bold" fill="#6b7686" letter-spacing="2">② PREPROCESSING</text>
+
+  <rect x="405" y="210" width="250" height="360" rx="8" fill="#ffffff" stroke="#111" stroke-width="2.4"/>
+  <text x="530" y="350" text-anchor="middle" font-size="26" font-weight="bold" fill="#111">Preprocessing</text>
+  <text x="530" y="394" text-anchor="middle" font-size="20" fill="#111">crop → 224 × 224</text>
+  <text x="530" y="434" text-anchor="middle" font-size="20" font-weight="bold" fill="#1a5fb4">same as training</text>
+
+  <line x1="655" y1="300" x2="705" y2="300" stroke="#111" stroke-width="2.6" marker-end="url(#a)"/>
+
+  <!-- ===================== stage 3 : inference ===================== -->
+  <text x="705" y="192" font-size="22" font-weight="bold" fill="#6b7686" letter-spacing="2">③ INFERENCE</text>
+
+  <rect x="705" y="210" width="200" height="180" rx="8" fill="#ffffff" stroke="#111" stroke-width="2.4"/>
+  <text x="805" y="262" text-anchor="middle" font-size="26" font-weight="bold" fill="#111">π0 model</text>
+  <text x="805" y="300" text-anchor="middle" font-size="20" fill="#111">flow matching</text>
+  <text x="805" y="336" text-anchor="middle" font-size="20" font-weight="bold" fill="#1a5fb4">16 × 7 chunk</text>
+
+  <line x1="905" y1="300" x2="955" y2="300" stroke="#111" stroke-width="2.6" marker-end="url(#a)"/>
+
+  <!-- ===================== stage 4 : ROS 2 drawn as layers ===================== -->
+  <text x="955" y="192" font-size="22" font-weight="bold" fill="#6b7686" letter-spacing="2">④ ROS 2 LAYERS</text>
+
+  <rect x="955" y="210" width="250" height="110" fill="#ffffff" stroke="#111" stroke-width="2.4"/>
+  <text x="1080" y="252" text-anchor="middle" font-size="26" font-weight="bold" fill="#111">Topic publish</text>
+  <text x="1080" y="288" text-anchor="middle" font-size="20" fill="#111">action chunk</text>
+
+  <rect x="955" y="320" width="250" height="130" fill="#ffffff" stroke="#111" stroke-width="2.4"/>
+  <text x="1080" y="362" text-anchor="middle" font-size="26" font-weight="bold" fill="#111">Safety layer</text>
+  <text x="1080" y="396" text-anchor="middle" font-size="20" fill="#111">Δq integration</text>
+  <text x="1080" y="426" text-anchor="middle" font-size="20" fill="#111">clamps · limits</text>
+
+  <rect x="955" y="450" width="250" height="110" fill="#ffffff" stroke="#111" stroke-width="2.4"/>
+  <text x="1080" y="492" text-anchor="middle" font-size="26" font-weight="bold" fill="#111">Robot driver</text>
+  <text x="1080" y="528" text-anchor="middle" font-size="20" fill="#111">MovJ / ServoJ</text>
+
+  <line x1="1080" y1="560" x2="1080" y2="620" stroke="#111" stroke-width="2.6" marker-end="url(#a)"/>
+
+  <!-- ===================== robot ===================== -->
+  <rect x="955" y="620" width="250" height="80" rx="8" fill="#ffffff" stroke="#111" stroke-width="2.4"/>
+  <text x="1080" y="670" text-anchor="middle" font-size="26" font-weight="bold" fill="#111">Magician E6</text>
+</svg>
