@@ -170,4 +170,13 @@ class E7Outputs(transforms.DataTransformFn):
         #   reverse is not — and fix the contract in the conversion script, not here.
         #   Binary executor rule (cmd = 1 if action[6] > 0.5) applies only if the
         #   conversion thresholds it.
-        return {"actions": acts[:, :7]}
+        out = {"actions": acts[:, :7]}
+        # 계약 2.1.0 `action.anchor` — 실행기는 q_target[k] = q_measured + (target[k] −
+        # anchor_state) 로 재기준화한다. anchor_state 는 **정책이 실제로 계획에 쓴 상태**여야
+        # 하고, 그것을 아는 것은 여기뿐이다. 클라이언트가 보낸 값을 그쪽이 기억하는 것과는
+        # 다르다 -- 입력 변환이 상태를 건드리면 둘이 갈리고, 갈린 걸 알 방법이 없어진다.
+        # 이 시점의 state 는 Unnormalize 를 이미 지나서 degree 단위이고, targets 와 같은
+        # 순서·단위다 (policy_config.py 의 output_transforms 순서).
+        if "state" in data:
+            out["anchor_state"] = np.asarray(data["state"])[:7]
+        return out

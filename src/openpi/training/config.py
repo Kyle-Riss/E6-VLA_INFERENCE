@@ -644,6 +644,12 @@ class LeRobotE7DataConfig(DataConfigFactory):
     # `create_trained_policy` never reads, so there is nothing to reproduce.
     label_jitter: bool = False
 
+    # The corpus was written with `--action-semantics current_relative`, so its actions are
+    # absolute next joint positions and have to be made chunk-relative at load time. Set
+    # this ONLY for such a corpus: applied to the sequential corpus it would subtract the
+    # state from an increment and produce nonsense that trains without complaint.
+    chunk_relative_actions: bool = False
+
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         repack = {
@@ -662,6 +668,20 @@ class LeRobotE7DataConfig(DataConfigFactory):
             inputs=[e7_policy.E7Inputs(model_type=model_config.model_type)],
             outputs=[e7_policy.E7Outputs()],
         )
+
+        if self.chunk_relative_actions:
+            # The corpus stores absolute next joint positions; this subtracts the chunk's
+            # first state from every step of it, which is the contract pi0 was pretrained
+            # under. Joints only -- the gripper is absolute in every openpi config.
+            #
+            # AbsoluteActions on the output side is what inference undoes it with, so a
+            # policy exported from such a run hands the executor absolute joint targets
+            # and the executor must add nothing.
+            _mask = _transforms.make_bool_mask(6, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(_mask)],
+                outputs=[_transforms.AbsoluteActions(_mask)],
+            )
         model_transforms = ModelTransformFactory()(model_config)
 
         return dataclasses.replace(
@@ -2141,6 +2161,117 @@ _CONFIGS = [
         batch_size=1,
         log_interval=50,
         freeze_filter=pi0_config.freeze_filter_vlm_frozen_vision_and_action_lora(),
+        ema_decay=None,
+    ),
+    # ── STEP 11 A/B (2026-09-02) ──────────────────────────────────────────────
+    # 번들 e7_bundle_C_20260901 이 `config_name` 으로 가리키는 정의다.
+    # 학습서버 `e7_trainconfig_20260902.tar.gz` 의 정의에서 **추론이 읽는 것만** 옮겼다.
+    #
+    # ⚠️ 생략한 학습 전용 필드 (M2' 때와 같은 판단, 위 M2' 주석 참조):
+    #    qg_lambda/tau/direct/smooth/bounded/roi · commit_window · grounding_target ·
+    #    label_jitter · episode_split_manifest/split · val_interval/val_batches · acc_every.
+    #    `e7_label_card_rois()` 와 `val_*` 는 이 트리에 존재하지도 않는다.
+    #    ⚠️ `episode_split_manifest` 는 학습 데이터로더(data_loader.py:171-188)만 읽고
+    #       `create_trained_policy` 는 열지 않는다(학습서버 R9 §4 확인).
+    #
+    # 🔴 `assets.asset_id` 가 번들의 norm_stats 경로다:
+    #    <번들>/assets/local/e7_books_v2_120_sg/norm_stats.json
+    #    이름만 바꿔 기존 config 를 쓰면 **예외 없이 통과하고 다른 통계로 정규화**한다.
+    TrainConfig(
+        name="pi05_e7_v2_120_sg",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+            discrete_state_input=True,
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m_lora_r16",
+            vision_lora_rank=16,
+            vision_lora_alpha=16.0,
+            vision_lora_layer_range=(18, 26),
+            action_expert_lora_layer_range=None,
+            # 🔴 qg_v2 와 다른 유일한 model 필드. 라벨 슬롯을 wrist 로 명명한다.
+            wrist_image_keys=("right_wrist_0_rgb",),
+            image_keys=("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb"),
+            # 이 넷이 추론에서 모듈을 만든다 (camera_role 1 + qg.* 8 + qg_gamma 1).
+            camera_role_embed=True,
+            query_grounding=True,
+            qg_slot=2,
+            qg_rank=64,
+        ),
+        data=LeRobotE7DataConfig(
+            repo_id="local/e7_books_v2_120_sg",
+            use_label_view=True,
+            base_config=DataConfig(prompt_from_task=True, action_sequence_keys=("action",)),
+            assets=AssetsConfig(assets_dir="assets/pi05_e7_v2_120_sg", asset_id="local/e7_books_v2_120_sg"),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=20_000,
+        batch_size=8,
+        log_interval=50,
+        save_interval=1000,
+        keep_period=1000,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1000, peak_lr=2.5e-5, decay_steps=60_000, decay_lr=2.5e-6),
+        freeze_filter=pi0_config.freeze_filter_v4_combined_lora(),
+        ema_decay=None,
+    ),
+    # ── STEP 11 A/B (2026-09-02) ──────────────────────────────────────────────
+    # 번들 e7_bundle_sgrel_20260901 이 `config_name` 으로 가리키는 정의다.
+    # 학습서버 `e7_trainconfig_20260902.tar.gz` 의 정의에서 **추론이 읽는 것만** 옮겼다.
+    #
+    # ⚠️ 생략한 학습 전용 필드 (M2' 때와 같은 판단, 위 M2' 주석 참조):
+    #    qg_lambda/tau/direct/smooth/bounded/roi · commit_window · grounding_target ·
+    #    label_jitter · episode_split_manifest/split · val_interval/val_batches · acc_every.
+    #    `e7_label_card_rois()` 와 `val_*` 는 이 트리에 존재하지도 않는다.
+    #    ⚠️ `episode_split_manifest` 는 학습 데이터로더(data_loader.py:171-188)만 읽고
+    #       `create_trained_policy` 는 열지 않는다(학습서버 R9 §4 확인).
+    #
+    # 🔴 `assets.asset_id` 가 번들의 norm_stats 경로다:
+    #    <번들>/assets/local/e7_books_v2_120_sgrel/norm_stats.json
+    #    이름만 바꿔 기존 config 를 쓰면 **예외 없이 통과하고 다른 통계로 정규화**한다.
+    TrainConfig(
+        name="pi05_e7_v2_120_sgrel",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+            discrete_state_input=True,
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m_lora_r16",
+            vision_lora_rank=16,
+            vision_lora_alpha=16.0,
+            vision_lora_layer_range=(18, 26),
+            action_expert_lora_layer_range=None,
+            # 🔴 qg_v2 와 다른 유일한 model 필드. 라벨 슬롯을 wrist 로 명명한다.
+            wrist_image_keys=("right_wrist_0_rgb",),
+            image_keys=("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb"),
+            # 이 넷이 추론에서 모듈을 만든다 (camera_role 1 + qg.* 8 + qg_gamma 1).
+            camera_role_embed=True,
+            query_grounding=True,
+            qg_slot=2,
+            qg_rank=64,
+        ),
+        data=LeRobotE7DataConfig(
+            repo_id="local/e7_books_v2_120_sgrel",
+            use_label_view=True,
+            # 🔴 이 config 가 존재하는 이유인 유일한 변수. 코퍼스가 절대 다음 관절각을
+            #    담고 있고, 이것이 청크 첫 state 기준 상대값으로 바꾼다. 출력 쪽
+            #    AbsoluteActions 가 되돌리므로 **번들 출력이 절대 관절각**이고 계약
+            #    `joint_target_mode: absolute` 다. 실행기는 아무것도 더하면 안 된다.
+            chunk_relative_actions=True,
+            base_config=DataConfig(prompt_from_task=True, action_sequence_keys=("action",)),
+            assets=AssetsConfig(assets_dir="assets/pi05_e7_v2_120_sgrel", asset_id="local/e7_books_v2_120_sgrel"),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=20_000,
+        batch_size=8,
+        log_interval=50,
+        save_interval=1000,
+        keep_period=1000,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1000, peak_lr=2.5e-5, decay_steps=60_000, decay_lr=2.5e-6),
+        freeze_filter=pi0_config.freeze_filter_v4_combined_lora(),
         ema_decay=None,
     ),
 ]

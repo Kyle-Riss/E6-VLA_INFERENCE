@@ -23,8 +23,43 @@ REPO="$(cd "$(dirname "$0")" && pwd)"
 #          119 에피소드 · **간판 배치 4개** · 홀드아웃 24개로 과적합 없음 확인
 # 둘 다 848텐서·attn_vec_merge=head_summed 라 **구조로는 구분되지 않는다.**
 # policy_node 의 지문 핀과 asset_id 검사가 갈라놓는다.
-BUNDLE="${1:-/mnt/robotdata/Dobot/e7_v2_120_step20000_bundle}"
-CONFIG="${2:-pi05_e7_v2_120_lora}"
+#   STEP 11 A/B (2026-09-02) — 아래 둘을 번갈아 돈다
+#   C      /mnt/robotdata/e7_bundle_C_20260901       pi05_e7_v2_120_sg     frame_delta
+#   sgrel  /mnt/robotdata/e7_bundle_sgrel_20260901   pi05_e7_v2_120_sgrel  chunk_relative
+BUNDLE="${1:-/mnt/robotdata/e7_bundle_C_20260901}"
+
+# 🔴 CONFIG 는 **번들의 manifest 에서 읽는다.** 인자로 따로 받으면 번들과 config 가
+#    어긋난 조합이 성립하고, A/B 처럼 둘을 번갈아 도는 실험에서 그건 한 번의 오타로
+#    조용히 일어난다. manifest 는 번들이 자기 자신에 대해 적은 값이라 갈릴 수 없다.
+#
+#    ⚠️ 2번째 인자로 넘기면 그것이 이긴다 — 다만 manifest 와 다르면 **경고**한다.
+#       (구버전 번들이나 디버깅용 탈출구)
+_MANIFEST_CONFIG=""
+if [ -f "$BUNDLE/manifest.json" ]; then
+    _MANIFEST_CONFIG=$(python3 -c "
+import json,sys
+try: print(json.load(open('$BUNDLE/manifest.json')).get('config_name') or '')
+except Exception: print('')" 2>/dev/null)
+fi
+CONFIG="${2:-$_MANIFEST_CONFIG}"
+if [ -z "$CONFIG" ]; then
+    echo "[오류] config 를 정할 수 없다 — $BUNDLE/manifest.json 에 config_name 이 없고"
+    echo "       2번째 인자도 안 왔다. 번들이 온전한지 확인할 것."
+    exit 1
+fi
+if [ -n "$_MANIFEST_CONFIG" ] && [ "$CONFIG" != "$_MANIFEST_CONFIG" ]; then
+    echo "[경고] config 가 manifest 와 다르다"
+    echo "       manifest : $_MANIFEST_CONFIG"
+    echo "       사용값   : $CONFIG   ← 인자로 덮어썼다"
+    echo "       ⚠️ asset_id 가 다르면 norm_stats 를 못 찾아 죽는다. 의도한 것인지 확인할 것."
+fi
+# CAG(Semantic Action Guidance).
+# 🔴 **값의 truth 는 번들의 `cag_config.json`** 이다. 여기 넘기는 값은 덮어쓰지 않고
+#    **대조만** 한다 — 다르면 서버가 기동을 거부한다. 안 넘기면 파일 값으로 돈다.
+#    ω 는 번들의 속성이고, 24/30 은 "이 가중치 + 이 ω" 조합에서 나온 값이다.
+# ⚠️ 3번째 인자는 원래 PORT 다(아래). CAG 는 **4번째**로 받는다 — 3번을 뺏으면
+#    기존 호출이 포트를 3.0 으로 읽고 죽는다(실제로 겪었다).
+CAG_OMEGA="${4:-}"
 PORT="${3:-8000}"
 
 if [ ! -d "$BUNDLE" ]; then
@@ -91,4 +126,5 @@ exec python "$REPO/scripts/serve_policy.py" \
     --port "$PORT" \
     policy:checkpoint \
     --policy.config "$CONFIG" \
-    --policy.dir "$BUNDLE"
+    --policy.dir "$BUNDLE" \
+    ${CAG_OMEGA:+--policy.cag-omega "$CAG_OMEGA"}
