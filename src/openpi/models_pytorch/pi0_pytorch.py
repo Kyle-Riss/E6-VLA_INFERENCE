@@ -438,23 +438,20 @@ class PI0Pytorch(nn.Module):
         return F.mse_loss(u_t, v_t, reduction="none")
 
     @torch.no_grad()
-    def sample_actions(self, device, observation, noise=None, num_steps=10) -> Tensor:
-        """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
-        bsize = observation.state.shape[0]
-        if noise is None:
-            actions_shape = (bsize, self.config.action_horizon, self.config.action_dim)
-            noise = self.sample_noise(actions_shape, device)
+    def _encode_prefix(self, images, img_masks, lang_tokens, lang_masks):
+        """Build the prefix KV cache for one language branch.
 
-        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=False)
-
+        Returns ``(past_key_values, prefix_pad_masks)`` as a pair on purpose. The two CAG
+        branches carry different prompt lengths (science 10 / liberal arts 11 / neutral 9),
+        so a cache is only ever valid together with the mask it was built under. Passing a
+        shared mask silently evaluates the two velocity fields at different positions --
+        that mistake once inverted the CAG conclusion on the training server.
+        """
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
-
-        # Compute image and language key value cache
         prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
         self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
-
         _, past_key_values = self.paligemma_with_expert.forward(
             attention_mask=prefix_att_2d_masks_4d,
             position_ids=prefix_position_ids,
@@ -462,6 +459,41 @@ class PI0Pytorch(nn.Module):
             inputs_embeds=[prefix_embs, None],
             use_cache=True,
         )
+        return past_key_values, prefix_pad_masks
+
+    def sample_actions(
+        self, device, observation, noise=None, num_steps=10, *, cag_omega=None, neutral_observation=None
+    ) -> Tensor:
+        """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)
+
+        With ``cag_omega`` and ``neutral_observation`` the policy runs category-augmented
+        guidance: a conditional and a category-neutral branch are integrated together as
+        ``v = v_N + omega * (v_L - v_N)`` at **every** denoising step. Mixing once on the
+        final action instead is not equivalent -- the destination statistic is computed on
+        3-way centered actions, where a linear mix cancels out and omega has no effect.
+
+        Omitting either argument keeps the original single-branch behaviour byte for byte.
+        """
+        bsize = observation.state.shape[0]
+        if noise is None:
+            actions_shape = (bsize, self.config.action_horizon, self.config.action_dim)
+            noise = self.sample_noise(actions_shape, device)
+
+        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=False)
+        past_key_values, prefix_pad_masks = self._encode_prefix(images, img_masks, lang_tokens, lang_masks)
+
+        kv_n = mask_n = None
+        if cag_omega is not None and neutral_observation is not None:
+            n_images, n_img_masks, n_lang_tokens, n_lang_masks, _ = self._preprocess_observation(
+                neutral_observation, train=False
+            )
+            if torch.equal(n_lang_tokens, lang_tokens):
+                raise ValueError(
+                    "neutral branch is identical to the conditional branch -- the category word was "
+                    "not substituted, so v_L - v_N is zero and omega has no effect. This fails loudly "
+                    "on purpose: a silent no-op here is indistinguishable from CAG being ineffective."
+                )
+            kv_n, mask_n = self._encode_prefix(n_images, n_img_masks, n_lang_tokens, n_lang_masks)
 
         dt = -1.0 / num_steps
         dt = torch.tensor(dt, dtype=torch.float32, device=device)
@@ -470,13 +502,10 @@ class PI0Pytorch(nn.Module):
         time = torch.tensor(1.0, dtype=torch.float32, device=device)
         while time >= -dt / 2:
             expanded_time = time.expand(bsize)
-            v_t = self.denoise_step(
-                state,
-                prefix_pad_masks,
-                past_key_values,
-                x_t,
-                expanded_time,
-            )
+            v_t = self.denoise_step(state, prefix_pad_masks, past_key_values, x_t, expanded_time)
+            if kv_n is not None:
+                v_n = self.denoise_step(state, mask_n, kv_n, x_t, expanded_time)
+                v_t = v_n + cag_omega * (v_t - v_n)
 
             # Euler step - use new tensor assignment instead of in-place operation
             x_t = x_t + dt * v_t

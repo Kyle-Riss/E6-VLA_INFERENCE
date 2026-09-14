@@ -87,6 +87,30 @@ class Policy(BasePolicy):
                 noise = noise[None, ...]  # Make it (1, action_horizon, action_dim)
             sample_kwargs["noise"] = noise
 
+        # ── CAG: 중립 브랜치 관측을 같은 파이프라인으로 만든다 ───────────────────
+        # `sample_actions(..., neutral_observation=)` 계약(학습서버 검증본)을 서빙에서
+        # 채우는 유일한 자리다. 여기가 obs dict 와 Observation 을 둘 다 아는 곳이다.
+        #
+        # 🔴 조건 관측과 **완전히 같은 변환**을 태워야 한다. 프롬프트만 다르고 나머지가
+        #    달라지면 두 속도장의 차이가 카테고리 단어가 아니라 전처리 차이를 담는다.
+        if "cag_omega" in sample_kwargs:
+            neutral_prompt = obs.get("neutral_prompt")
+            if neutral_prompt is None:
+                raise ValueError(
+                    "cag_omega 가 설정됐는데 관측에 'neutral_prompt' 가 없다 — 중립 브랜치를 "
+                    "만들 수 없다. 조용히 단일 브랜치로 돌면 ω 가 무력화된 것과 구분되지 않는다."
+                )
+            n_src = {k: v for k, v in obs.items() if k != "neutral_prompt"}
+            n_src["prompt"] = neutral_prompt
+            n_inputs = self._input_transform(jax.tree.map(lambda x: x, n_src))
+            if self._is_pytorch_model:
+                n_inputs = jax.tree.map(
+                    lambda x: torch.from_numpy(np.array(x)).to(self._pytorch_device)[None, ...], n_inputs)
+            else:
+                n_inputs = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], n_inputs)
+            sample_kwargs["neutral_observation"] = _model.Observation.from_dict(n_inputs)
+        # ─────────────────────────────────────────────────────────────────────────
+
         observation = _model.Observation.from_dict(inputs)
         start_time = time.monotonic()
         outputs = {
