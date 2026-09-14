@@ -821,6 +821,68 @@ _CONFIGS = [
         freeze_filter=pi0_config.freeze_filter_v4_combined_lora(),
         ema_decay=None,
     ),
+    # ── M2' (Deployment Contract v1, 2026-08-26) ──────────────────────────────
+    # 번들 e7_handoff_20260826 이 `config_name` 으로 가리키는 정의다.
+    #
+    # 🔴 이름 문제가 아니다. 서빙 경로가 `_config.get_config(name).model` 로 모델
+    #    설정을 **소스에서 되살린다.** query_grounding / camera_role_embed / qg_slot /
+    #    qg_rank 가 여기 없으면 `pi0_pytorch.py` 가 모듈을 아예 안 만들고
+    #    (`getattr(config, "query_grounding", False)`), strict 로드가 텐서 10개
+    #    (camera_role 1 + qg.* 8 + qg_gamma 1)를 unexpected 로 거부한다.
+    #
+    # ⚠️ 학습 전용 필드는 옮기지 않았다 — 추론 경로가 읽지 않는다(실측: pi0_pytorch 가
+    #    보는 것은 camera_role_embed · query_grounding · qg_rank · qg_slot 넷뿐).
+    #    특히 `qg_roi=e7_label_card_rois()` 는 그 함수가 이 트리에 없고 불필요하다.
+    #    commit_window · grounding_target · label_jitter · episode_split_manifest ·
+    #    val_* · acc_every 도 같은 이유로 생략했다.
+    #
+    # ⚠️ qg_slot=2 는 image_keys 의 **마지막 = right_wrist_0_rgb(라벨 뷰)** 다.
+    #    순서가 다르면 엉뚱한 카메라에 주입되고 **에러가 안 난다** — 로드 시 대조할 것.
+    TrainConfig(
+        name="pi05_e7_v2_120_qg_v2",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+            discrete_state_input=True,
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m_lora_r16",
+            vision_lora_rank=16,
+            vision_lora_alpha=16.0,
+            vision_lora_layer_range=(18, 26),
+            action_expert_lora_layer_range=None,
+            wrist_image_keys=(),
+            image_keys=("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb"),
+            # M2' — 이 넷이 추론에서 모듈을 만든다.
+            camera_role_embed=True,
+            query_grounding=True,
+            qg_slot=2,
+            qg_rank=64,
+        ),
+        data=LeRobotE7DataConfig(
+            repo_id="local/e7_books_v2_120",
+            use_label_view=True,
+            base_config=DataConfig(prompt_from_task=True, action_sequence_keys=("action",)),
+            # 학습 원본과 같은 문자열을 그대로 둔다 — norm_stats 를 camid 실험과 공유했다.
+            # 서빙에서 이 경로는 쓰이지 않는다: `create_base_config` 가 여기서 읽어보고
+            # 실패하면 `norm_stats=None` 으로 넘어가고, `create_trained_policy:64` 가
+            # **번들 안** `assets/<asset_id>/norm_stats.json` 으로 다시 읽어 덮는다.
+            # 그래도 원본과 다른 문자열을 적으면 이 파일을 계약 문서로 읽는 쪽이
+            # 학습 assets 위치를 잘못 알게 된다.
+            assets=AssetsConfig(assets_dir="assets/pi05_e7_v2_120_camid", asset_id="local/e7_books_v2_120"),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=6_000,
+        batch_size=8,
+        log_interval=50,
+        save_interval=1000,
+        keep_period=2000,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1000, peak_lr=2.5e-5, decay_steps=60_000, decay_lr=2.5e-6),
+        freeze_filter=pi0_config.freeze_filter_v4_combined_lora(),
+        ema_decay=None,
+    ),
+    # ─────────────────────────────────────────────────────────────────────────
     TrainConfig(
         # Serves the 2026-08-20 bundle (`e7_v2_120_step20000_bundle`, step 20000),
         # trained on the 119-episode corpus with FOUR sign layouts. Same model as

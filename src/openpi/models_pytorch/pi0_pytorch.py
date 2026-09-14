@@ -90,6 +90,39 @@ class PI0Pytorch(nn.Module):
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
 
+        # ── Deployment Contract v1 §1.5 ────────────────────────────────────────
+        # JAX 가 학습하는 두 모듈. 변환기가 한때 조용히 버렸고, 없으면 배포본이 M0 에
+        # 가까워진다. 그리고 M0 + CAG 는 "효과 없음"이 아니라 **역효과**(14/30, diag
+        # −0.206)라 그 부재가 M2′ 의 실패로 오독된다.
+        _w = getattr(config, "width", 2048)
+        self._n_slots = len(getattr(config, "image_keys", ()) or ())
+        self.camera_role = (
+            torch.nn.Parameter(torch.zeros(self._n_slots, _w))
+            if getattr(config, "camera_role_embed", False) and self._n_slots
+            else None
+        )
+        if getattr(config, "query_grounding", False):
+            _r = getattr(config, "qg_rank", 64)
+            self._qg_slot = (
+                config.qg_slot if getattr(config, "qg_slot", None) is not None else self._n_slots - 1
+            )
+            # 🔴 범위 밖이면 `slot == self._qg_slot` 이 한 번도 참이 안 된다 — 모듈은
+            #    만들어지고 strict 로드도 통과하는데 **주입만 안 일어나 M0 가 된다.**
+            #    에러도 로그도 없다. 그래서 여기서 막는다.
+            if not (0 <= self._qg_slot < self._n_slots):
+                raise ValueError(
+                    f"qg_slot={self._qg_slot} 이 image_keys 범위 밖이다 "
+                    f"(슬롯 {self._n_slots}개: {tuple(getattr(config, 'image_keys', ()) or ())})."
+                )
+            self.qg = torch.nn.ModuleDict({
+                "w_q": torch.nn.Linear(_w, _r), "w_z": torch.nn.Linear(_w, _r),
+                "a": torch.nn.Linear(_w, _w),
+                "ln": torch.nn.LayerNorm(_w, eps=1e-6),   # flax nnx.LayerNorm, RMSNorm 아님
+            })
+            self.qg_gamma = torch.nn.Parameter(torch.zeros(()))
+        else:
+            self.qg, self.qg_gamma, self._qg_slot = None, None, None
+        # ───────────────────────────────────────────────────────────────────────
         self.paligemma_with_expert = PaliGemmaWithExpertModel(
             paligemma_config,
             action_expert_config,
@@ -201,13 +234,37 @@ class PI0Pytorch(nn.Module):
         pad_masks = []
         att_masks = []
 
+        # 질의 요약 — 이미지보다 먼저 읽어야 이미지를 조건화할 수 있다.
+        q_summary = None
+        if self.qg is not None:
+            _le = self.paligemma_with_expert.embed_language_tokens(lang_tokens)
+            _m = lang_masks[..., None].to(_le.dtype)
+            q_summary = (_le * _m).sum(dim=1) / _m.sum(dim=1).clamp(min=1.0)
+
         # Process images
-        for img, img_mask in zip(images, img_masks, strict=True):
+        for slot, (img, img_mask) in enumerate(zip(images, img_masks, strict=True)):
 
             def image_embed_func(img):
                 return self.paligemma_with_expert.embed_image(img)
 
             img_emb = self._apply_checkpoint(image_embed_func, img)
+
+            # 어느 카메라의 토큰인지 명시한다.
+            if self.camera_role is not None:
+                img_emb = img_emb + self.camera_role[slot].to(img_emb.dtype)
+
+            # 질의 조건부 게이트 — 진단이 가리킨 그 슬롯(라벨 뷰)에만.
+            if self.qg is not None and slot == self._qg_slot:
+                # 🔴 dtype 정합 — `policy_config.py:55` 는 paligemma_with_expert 만
+                #    캐스팅한다. qg 는 fp32 로 남아 bf16 입력과 충돌한다.
+                if self.qg["w_z"].weight.dtype != img_emb.dtype:
+                    self.qg.to(dtype=img_emb.dtype)
+                    self.qg_gamma.data = self.qg_gamma.data.to(dtype=img_emb.dtype)
+                _s = torch.einsum(
+                    "bnr,br->bn", self.qg["w_z"](img_emb), self.qg["w_q"](q_summary.to(img_emb.dtype))
+                ) / math.sqrt(self.qg["w_q"].out_features)
+                _scale = torch.tanh(self.qg_gamma).to(img_emb.dtype)
+                img_emb = img_emb + _scale * torch.sigmoid(_s)[..., None] * self.qg["ln"](self.qg["a"](img_emb))
 
             bsize, num_img_embs = img_emb.shape[:2]
 

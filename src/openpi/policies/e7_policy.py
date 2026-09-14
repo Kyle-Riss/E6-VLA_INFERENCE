@@ -1,4 +1,8 @@
+import ast
 import dataclasses
+import functools
+import json
+import pathlib
 
 import einops
 import numpy as np
@@ -34,6 +38,38 @@ def _parse_image(image) -> np.ndarray:
     return image
 
 
+_SIDES = ("left", "center", "right")
+
+
+@functools.cache
+def _shelf_layouts(repo_id: str) -> dict[int, int] | None:
+    """Which shelf position each episode's own category sits at, keyed by episode index.
+
+    Read from the dataset's own ``meta/e7_context.json`` rather than from a column, because
+    the layout is a property of the episode and the recorded frames already carry the episode
+    index. Nothing is re-converted to add this.
+
+    Returns None when the file is absent -- datasets without shelf signs simply have no
+    grounding target, and the model raises only if a run actually asks for one.
+    """
+    path = pathlib.Path.home() / ".cache/huggingface/lerobot" / repo_id / "meta/e7_context.json"
+    if not path.exists():
+        return None
+    episodes = json.loads(path.read_text())["episodes"]
+    out = {}
+    for key, meta in episodes.items():
+        layout = meta.get("shelf_layout")
+        category = meta.get("category")
+        if not layout or not category:
+            continue
+        if isinstance(layout, str):
+            layout = ast.literal_eval(layout)
+        side = layout.get(category)
+        if side in _SIDES:
+            out[int(key)] = _SIDES.index(side)
+    return out or None
+
+
 @dataclasses.dataclass(frozen=True)
 class E7Inputs(transforms.DataTransformFn):
     """xArm 6 (E7) inputs — 7D state/action, same contract as E6 v16+.
@@ -46,6 +82,10 @@ class E7Inputs(transforms.DataTransformFn):
 
     # Determines which model will be used.
     model_type: _model.ModelType
+
+    # Dataset to read shelf layouts from when a run trains with the query-grounding
+    # auxiliary term. None (the default) emits no target, which is every other run.
+    grounding_repo_id: str | None = None
 
     def __call__(self, data: dict) -> dict:
         hik_image = _parse_image(data["observation/exterior_image_1_left"])
@@ -93,10 +133,25 @@ class E7Inputs(transforms.DataTransformFn):
         if "actions" in data:
             inputs["actions"] = np.asarray(data["actions"])
 
+        # LeRobot marks the chunk steps it had to invent when the horizon ran past the end
+        # of the episode; it fills them by repeating the last real action. Carried through
+        # as its complement so the loss can drop them. Absent at inference and on datasets
+        # that predate the flag, and absent means every step is real.
+        if "action_is_pad" in data:
+            inputs["action_valid"] = ~np.asarray(data["action_is_pad"], dtype=bool)
+
         if "prompt" in data:
             if isinstance(data["prompt"], bytes):
                 data["prompt"] = data["prompt"].decode("utf-8")
             inputs["prompt"] = data["prompt"]
+
+        if self.grounding_repo_id is not None and "observation/episode_index" in data:
+            layouts = _shelf_layouts(self.grounding_repo_id)
+            if layouts is not None:
+                episode = int(np.asarray(data["observation/episode_index"]))
+                # -1 for an episode the metadata does not describe. The loss masks those out
+                # rather than scoring a guess.
+                inputs["grounding_target"] = np.int32(layouts.get(episode, -1))
 
         return inputs
 

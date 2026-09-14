@@ -89,6 +89,34 @@ class Pi0Config(_model.BaseModelConfig):
     # so checkpoints stay loadable across the change.
     image_keys: tuple[str, ...] = _model.IMAGE_KEYS
 
+    # ── M2' (Deployment Contract v1) ──────────────────────────────────────────
+    # 🔴 기본값이 전부 inert 해야 한다. `query_grounding: bool = True` 같은 실수 하나로
+    #    E6 v16~v26 · E7 v1 · v2_60 · v2_120 서빙이 **조용히** 바뀐다(모듈이 생기고
+    #    strict 로드가 거부한다). 비트 동일 게이트로 매번 확인할 것.
+    #
+    # 추론이 실제로 읽는 것은 아래 넷뿐이다(`pi0_pytorch.py` 실측):
+    #   camera_role_embed · query_grounding · qg_rank · qg_slot
+    camera_role_embed: bool = False
+    query_grounding: bool = False
+    # None 이면 마지막 슬롯 — image_keys 순서상 라벨 뷰(right_wrist_0_rgb).
+    # ⚠️ 순서가 다르면 엉뚱한 카메라에 주입되고 **에러가 안 난다.** 로드 시 대조할 것.
+    qg_slot: int | None = None
+    qg_rank: int = 64
+
+    # 아래는 **학습 전용**이다. 추론 경로는 읽지 않는다(`pi0_pytorch.py` 는 bounded
+    # 형태를 무조건 쓴다). 계약 문서화를 위해 자리만 두고, **기본값은 학습서버 원본
+    # 정의와 글자 단위로 같게** 맞춘다 — 처음엔 내가 임의로 1.0/1.0/0.0 을 적었는데,
+    # 추론에서 안 읽힌다는 이유로 원본과 다른 값을 남기면 이 파일을 계약 문서로 읽는
+    # 쪽이 학습 설정을 잘못 읽는다. `qg_roi` 는 학습 쪽 `e7_label_card_rois()` 의
+    # 산출물이고 그 함수가 이 트리에 없다 — 추론에 불필요하므로 옮기지 않았다.
+    qg_lambda: float = 0.0
+    qg_tau: float = 0.07
+    qg_direct: bool = False
+    qg_smooth: float = 0.05
+    qg_bounded: bool = False
+    qg_roi: tuple[tuple[int, ...], ...] | None = None
+    # ─────────────────────────────────────────────────────────────────────────
+
     pytorch_compile_mode: str | None = "max-autotune"
 
     def __post_init__(self):
