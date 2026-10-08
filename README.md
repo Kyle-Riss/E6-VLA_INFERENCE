@@ -3,6 +3,43 @@
 Dobot E6 로봇 팔을 위한 π0.5 VLA(Vision-Language-Action) 추론 파이프라인입니다.  
 [Physical Intelligence의 openpi](https://github.com/physical-intelligence/openpi) 기반으로, Jetson AGX Orin 환경에 맞게 구성되어 있습니다.
 
+## 📖 문서 읽는 순서
+
+처음 보는 사람은 위에서부터 차례로 읽으면 된다. **1~3만 읽어도 로봇을 돌릴 수 있다.**
+
+**실행하기**
+
+1. **이 README** — 전체 구조(노드 5개, 토픽), 관측/액션 계약, 지원 모델
+2. **[docs/RUN_DOBOT_E6.md](docs/RUN_DOBOT_E6.md)** — 실제 실행 순서와 **실행 전 확인 3가지** (2026-10-08, 가장 최신)
+3. **[docs/E6_EVAL_PROTOCOL.md](docs/E6_EVAL_PROTOCOL.md)** — 실기 결과를 남기는 형식. 평가를 돌리기 **전에** 읽을 것
+
+**구조 이해하기**
+
+4. [docs/ROS2_ARCHITECTURE.md](docs/ROS2_ARCHITECTURE.md) — ROS2 노드 설계
+5. [docs/ROS2_FLOWCHART.md](docs/ROS2_FLOWCHART.md) — 데이터가 노드 사이를 흐르는 순서
+6. [docs/LAYER_ARCHITECTURE.md](docs/LAYER_ARCHITECTURE.md) — Context · Policy · Execution 3계층 (2×2 ablation)
+7. [docs/ROS2_LATENCY_OPTIMIZATION.md](docs/ROS2_LATENCY_OPTIMIZATION.md) — 추론 지연과 chunk pacing
+
+**참고 자료 (필요할 때만)**
+
+8. [docs/CHECKPOINT_CODE_DEF.md](docs/CHECKPOINT_CODE_DEF.md) — 체크포인트 폴더 구조와 로더 코드
+9. [docs/norm_stats.md](docs/norm_stats.md) — 정규화 통계 (openpi 원문)
+10. [docs/STAGE1_PAPER_EVIDENCE.md](docs/STAGE1_PAPER_EVIDENCE.md) — 논문에 쓸 수 있는 수치와 근거 등급
+
+**옛 문서 (ROS2 이전, 2026-04 기준 — 지금 실행에는 쓰지 말 것)**
+
+11. [docs/USAGE.md](docs/USAGE.md) — `run_e6_client.py` 기반 (이 파일은 지금 레포에 없다)
+12. [docs/INFERENCE.md](docs/INFERENCE.md) — move-one 시절 추론 가이드
+13. [docs/ROBOT_INFERENCE.md](docs/ROBOT_INFERENCE.md) — 같은 시기, 20Hz 기준
+14. [docs/ACTION_CHUNKING_20HZ.md](docs/ACTION_CHUNKING_20HZ.md) — 20Hz 환산 (현재는 16Hz)
+15. [docs/ROS2_IMPLEMENTATION_PLAN.md](docs/ROS2_IMPLEMENTATION_PLAN.md) — ROS2 구현 당시 작업 계획
+
+**openpi 원본 문서 (E6 와 무관)**
+
+16. [docs/remote_inference.md](docs/remote_inference.md), [docs/docker.md](docs/docker.md)
+
+---
+
 ## 아키텍처
 
 ```
